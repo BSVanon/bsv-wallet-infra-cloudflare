@@ -11,19 +11,20 @@ routes = [
 ]
 
 [vars]
-# Public chaintracker worker exposing /findHeaderHexForHeight.
-# Default points at the open `Calhooon/chaintracks-cloudflare` deployment;
-# replace with your own deploy if you'd rather not depend on it.
-CHAINTRACKS_URL = "https://chaintracks.example.com"
+# Self-hosted chaintracks (BSVanon/chaintracks-cloudflare) exposing
+# /findHeaderHexForHeight. ChainTracksProvider is primary; the storage server
+# transparently falls back to direct WhatsOnChain calls when chaintracks
+# errors or is mid-sync, so flipping `strict` is safe immediately after
+# chaintracks deploy (it doesn't need a fully-synced header chain to be useful).
+CHAINTRACKS_URL = "https://chaintracks.sendbsv.com"
 
 # BEEF verification mode: "strict" | "log_only" | "skip"
-#   strict   — hard-reject on bad merkle root (recommended)
+#   strict   — hard-reject on bad merkle root (recommended for funds)
 #   log_only — validate + log, return BEEF anyway
 #   skip     — bypass tracker entirely (drain-time / emergency only)
-# BRING-UP 2026-05-29: log_only so a placeholder CHAINTRACKS_URL can't hard-
-# reject during first deploy + L2 round-trip proof. REVERT TO "strict" before
-# any real funds ride on this server (after a real chaintracks is wired).
-BEEF_VERIFICATION = "log_only"
+# 2026-05-29: flipped to strict now that self-hosted chaintracks is live at
+# chaintracks.sendbsv.com (D1+R2+cron) — primary with WoC fallback.
+BEEF_VERIFICATION = "strict"
 
 # Secrets (set via `wrangler secret put`):
 #   ARC_API_KEY — TAAL ARC API key for broadcast acceleration (optional).
