@@ -1294,12 +1294,14 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         if let Some(row) = existing {
             let local_id = row.id.map(|v| v as i64).unwrap_or(0);
             if req.updated_at > parse_datetime_pub(&row.updated_at) {
-                Query::new("UPDATE proven_tx_reqs SET status = ?, attempts = ?, history = ?, notified = ?, proven_tx_id = ?, updated_at = ? WHERE proven_tx_req_id = ?")
+                Query::new("UPDATE proven_tx_reqs SET status = ?, attempts = ?, history = ?, notified = ?, notify = ?, proven_tx_id = ?, batch = ?, updated_at = ? WHERE proven_tx_req_id = ?")
                     .bind(status)
                     .bind(req.attempts as i64)
                     .bind(req.history.as_str())
                     .bind(if req.notified { 1i64 } else { 0 })
+                    .bind(req.notify.as_str())
                     .bind(req.proven_tx_id)
+                    .bind(req.batch.clone())
                     .bind(req.updated_at)
                     .bind(local_id)
                     .execute(self.db)
@@ -1311,7 +1313,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         } else {
             // raw_tx is NOT NULL — bind inline; input_beef two-phase.
             let raw_tx = req.raw_tx.clone().unwrap_or_default();
-            let meta = Query::new("INSERT INTO proven_tx_reqs (txid, status, attempts, history, notify, notified, raw_tx, input_beef, proven_tx_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)")
+            let meta = Query::new("INSERT INTO proven_tx_reqs (txid, status, attempts, history, notify, notified, raw_tx, input_beef, proven_tx_id, batch, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)")
                 .bind(req.txid.as_str())
                 .bind(status)
                 .bind(req.attempts as i64)
@@ -1320,6 +1322,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 .bind(if req.notified { 1i64 } else { 0 })
                 .bind(raw_tx.as_slice())
                 .bind(req.proven_tx_id)
+                .bind(req.batch.clone())
                 .bind(req.created_at)
                 .bind(req.updated_at)
                 .execute(self.db)
