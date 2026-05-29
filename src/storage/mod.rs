@@ -8,6 +8,7 @@ pub mod internalize_action;
 pub mod process_action;
 pub mod readers;
 pub mod relinquish_output;
+pub mod sync;
 pub mod writers;
 
 use worker::{Bucket, D1Database};

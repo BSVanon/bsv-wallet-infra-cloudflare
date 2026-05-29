@@ -19,7 +19,7 @@ use crate::storage::readers::{
 };
 use crate::storage::relinquish_output::RelinquishOutputArgs;
 use crate::storage::StorageD1;
-use crate::types::{AuthId, FindCertificatesArgs};
+use crate::types::{AuthId, FindCertificatesArgs, RequestSyncChunkArgs, SyncChunk};
 
 use bsv_sdk::wallet::{AbortActionArgs, CreateActionArgs, InternalizeActionArgs};
 
@@ -96,6 +96,10 @@ pub async fn dispatch<B: crate::services::BroadcastService + crate::services::Pr
 
         // Output management
         "relinquishOutput" => handle_relinquish_output(storage, params, id.clone(), auth).await,
+
+        // BRC-40 chunk sync (L2 durable-funds): local↔remote wallet state sync
+        "getSyncChunk" => handle_get_sync_chunk(storage, params, id.clone(), auth).await,
+        "processSyncChunk" => handle_process_sync_chunk(storage, params, id.clone(), auth).await,
 
         // Phase 4: Monitor
         "reviewStatus" => handle_review_status(storage, id.clone(), auth).await,
@@ -451,6 +455,85 @@ async fn handle_review_status<
 
     let result = serde_json::json!({ "status_synced": count });
     Ok(serde_json::to_value(JsonRpcResponse::success(id, result)).unwrap())
+}
+
+// =============================================================================
+// BRC-40 chunk sync handlers (getSyncChunk / processSyncChunk)
+// =============================================================================
+
+/// `getSyncChunk` — the wallet sends positional `[args]` (RequestSyncChunkArgs).
+/// We resolve the user from the BRC-31 authenticated identity (the secure
+/// equivalent of the canonical `args.identity_key` lookup; in practice they are
+/// the same identity) and return a bounded chunk of that user's data.
+async fn handle_get_sync_chunk<
+    B: crate::services::BroadcastService + crate::services::ProofService,
+>(
+    storage: &StorageD1<'_, B>,
+    params: Value,
+    id: Value,
+    auth: Option<&AuthId>,
+) -> Result<Value, Error> {
+    let auth = auth
+        .ok_or_else(|| Error::ValidationError("getSyncChunk requires authentication".to_string()))?;
+    let (user_id, _auth) = storage.resolve_auth(auth).await?;
+    let args_val = extract_args(&params, true);
+    let args: RequestSyncChunkArgs = serde_json::from_value(args_val)?;
+    let chunk = storage.get_sync_chunk(user_id, args).await?;
+    let result_val = serde_json::to_value(&chunk)?;
+    Ok(serde_json::to_value(JsonRpcResponse::success(id, result_val)).unwrap())
+}
+
+/// `processSyncChunk` — the wallet sends positional `[args, chunk]`. Unlike the
+/// single-arg auth'd methods, `extract_args` can't serve both, so split the
+/// array manually (named `{args, chunk}` accepted as a fallback).
+async fn handle_process_sync_chunk<
+    B: crate::services::BroadcastService + crate::services::ProofService,
+>(
+    storage: &StorageD1<'_, B>,
+    params: Value,
+    id: Value,
+    auth: Option<&AuthId>,
+) -> Result<Value, Error> {
+    let auth = auth.ok_or_else(|| {
+        Error::ValidationError("processSyncChunk requires authentication".to_string())
+    })?;
+    let (user_id, _auth) = storage.resolve_auth(auth).await?;
+
+    let (args_val, chunk_val) = match &params {
+        Value::Array(arr) => {
+            let args_val = arr
+                .first()
+                .cloned()
+                .ok_or_else(|| Error::ValidationError("processSyncChunk: missing args".to_string()))?;
+            let chunk_val = arr
+                .get(1)
+                .cloned()
+                .ok_or_else(|| Error::ValidationError("processSyncChunk: missing chunk".to_string()))?;
+            (args_val, chunk_val)
+        }
+        Value::Object(_) => {
+            let args_val = params
+                .get("args")
+                .cloned()
+                .ok_or_else(|| Error::ValidationError("processSyncChunk: missing args".to_string()))?;
+            let chunk_val = params
+                .get("chunk")
+                .cloned()
+                .ok_or_else(|| Error::ValidationError("processSyncChunk: missing chunk".to_string()))?;
+            (args_val, chunk_val)
+        }
+        _ => {
+            return Err(Error::ValidationError(
+                "processSyncChunk: expected [args, chunk] or {args, chunk}".to_string(),
+            ))
+        }
+    };
+
+    let args: RequestSyncChunkArgs = serde_json::from_value(args_val)?;
+    let chunk: SyncChunk = serde_json::from_value(chunk_val)?;
+    let result = storage.process_sync_chunk(user_id, args, chunk).await?;
+    let result_val = serde_json::to_value(&result)?;
+    Ok(serde_json::to_value(JsonRpcResponse::success(id, result_val)).unwrap())
 }
 
 // =============================================================================
