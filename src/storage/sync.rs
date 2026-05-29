@@ -1294,12 +1294,20 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         if let Some(row) = existing {
             let local_id = row.id.map(|v| v as i64).unwrap_or(0);
             if req.updated_at > parse_datetime_pub(&row.updated_at) {
-                Query::new("UPDATE proven_tx_reqs SET status = ?, attempts = ?, history = ?, notified = ?, notify = ?, proven_tx_id = ?, batch = ?, updated_at = ? WHERE proven_tx_req_id = ?")
+                // raw_tx is BLOB NOT NULL — canonical process_action can
+                // mutate it post-creation (the wire only carries the final
+                // signed payload; an existing local row may pre-date the
+                // signed form). Refresh it on UPDATE too so a newer-wins
+                // replacement carries the right bytes. Coalesce a missing
+                // raw_tx to empty (real reqs always carry it).
+                let raw_tx_update = req.raw_tx.clone().unwrap_or_default();
+                Query::new("UPDATE proven_tx_reqs SET status = ?, attempts = ?, history = ?, notified = ?, notify = ?, raw_tx = ?, proven_tx_id = ?, batch = ?, updated_at = ? WHERE proven_tx_req_id = ?")
                     .bind(status)
                     .bind(req.attempts as i64)
                     .bind(req.history.as_str())
                     .bind(if req.notified { 1i64 } else { 0 })
                     .bind(req.notify.as_str())
+                    .bind(raw_tx_update.as_slice())
                     .bind(req.proven_tx_id)
                     .bind(req.batch.clone())
                     .bind(req.updated_at)
