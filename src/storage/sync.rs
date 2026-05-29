@@ -224,6 +224,11 @@ struct TransactionSyncRow {
     raw_tx_hex: Option<String>,
     input_beef_hex: Option<String>,
     is_outgoing: Option<f64>,
+    // The proof linkage travels on the wire as `proofTxid` (a txid string,
+    // canonical `TableTransaction.proof_txid`). Our schema models it as an
+    // INTEGER FK `transactions.proven_tx_id` → `proven_txs.proven_tx_id`, so we
+    // surface the linked proof's txid via a LEFT JOIN (NULL when unproven).
+    proof_txid: Option<String>,
     created_at: Option<String>,
     updated_at: Option<String>,
 }
@@ -875,15 +880,21 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         offset: u32,
         limit: u32,
     ) -> Result<Vec<TableTransaction>> {
+        // LEFT JOIN proven_txs so the proof linkage round-trips as the wire's
+        // `proofTxid` string (canonical fidelity). Columns are qualified with
+        // the `t.` alias because both tables carry txid/created_at/updated_at.
         let mut sql = String::from(
-            "SELECT transaction_id, user_id, txid, status, reference, description, satoshis, version, \
-             lock_time, hex(raw_tx) AS raw_tx_hex, hex(input_beef) AS input_beef_hex, is_outgoing, \
-             created_at, updated_at FROM transactions WHERE user_id = ?",
+            "SELECT t.transaction_id, t.user_id, t.txid, t.status, t.reference, t.description, \
+             t.satoshis, t.version, t.lock_time, hex(t.raw_tx) AS raw_tx_hex, \
+             hex(t.input_beef) AS input_beef_hex, t.is_outgoing, p.txid AS proof_txid, \
+             t.created_at, t.updated_at \
+             FROM transactions t LEFT JOIN proven_txs p ON t.proven_tx_id = p.proven_tx_id \
+             WHERE t.user_id = ?",
         );
         if since.is_some() {
-            sql.push_str(" AND updated_at > ?");
+            sql.push_str(" AND t.updated_at > ?");
         }
-        sql.push_str(" ORDER BY updated_at ASC LIMIT ? OFFSET ?");
+        sql.push_str(" ORDER BY t.updated_at ASC LIMIT ? OFFSET ?");
         let mut q = Query::new(sql).bind(user_id);
         if let Some(s) = since {
             q = q.bind(s);
@@ -907,12 +918,28 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 raw_tx,
                 input_beef,
                 is_outgoing: r.is_outgoing.map(|v| v != 0.0).unwrap_or(false),
-                proof_txid: None,
+                proof_txid: r.proof_txid,
                 created_at: parse_datetime_pub(&r.created_at),
                 updated_at: parse_datetime_pub(&r.updated_at),
             });
         }
         Ok(out)
+    }
+
+    /// Resolve a wire `proofTxid` (a proof's txid string) to the LOCAL
+    /// `proven_txs.proven_tx_id` FK, or `None` if absent / not present locally.
+    /// Same lookup `internalize_action` uses to link a proof to a transaction.
+    async fn resolve_proof_fk(&self, proof_txid: Option<&str>) -> Result<Option<i64>> {
+        let Some(txid) = proof_txid else { return Ok(None) };
+        #[derive(Deserialize)]
+        struct PtRow {
+            proven_tx_id: Option<f64>,
+        }
+        let row: Option<PtRow> = Query::new("SELECT proven_tx_id FROM proven_txs WHERE txid = ?")
+            .bind(txid)
+            .fetch_optional(self.db)
+            .await?;
+        Ok(row.and_then(|r| r.proven_tx_id.map(|v| v as i64)))
     }
 
     async fn fetch_outputs_for_sync(
@@ -1369,6 +1396,9 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 .fetch_optional(self.db)
                 .await?;
         let status = tx.status.as_str();
+        // Resolve the wire proofTxid → local proven_txs FK (proven_txs sync
+        // BEFORE transactions in process_sync_chunk, so the link is present).
+        let proof_fk = self.resolve_proof_fk(tx.proof_txid.as_deref()).await?;
         if let Some(row) = existing {
             let local_id = row.id.map(|v| v as i64).unwrap_or(0);
             if tx.updated_at > parse_datetime_pub(&row.updated_at) {
@@ -1386,10 +1416,19 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                     .await?;
                 self.put_blob_column("transactions", local_id, "raw_tx", tx.raw_tx.as_deref(), tx.updated_at, true).await?;
                 self.put_blob_column("transactions", local_id, "input_beef", tx.input_beef.as_deref(), tx.updated_at, true).await?;
+                // Link the proof FK only when resolvable — never NULL out an
+                // existing local link (matches internalize_action's link step).
+                if let Some(fk) = proof_fk {
+                    Query::new("UPDATE transactions SET proven_tx_id = ? WHERE transaction_id = ?")
+                        .bind(fk)
+                        .bind(local_id)
+                        .execute(self.db)
+                        .await?;
+                }
             }
             Ok(UpsertResult { local_id, is_new: false })
         } else {
-            let meta = Query::new("INSERT INTO transactions (user_id, txid, status, reference, description, satoshis, version, lock_time, is_outgoing, raw_tx, input_beef, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)")
+            let meta = Query::new("INSERT INTO transactions (user_id, txid, status, reference, description, satoshis, version, lock_time, is_outgoing, proven_tx_id, raw_tx, input_beef, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)")
                 .bind(user_id)
                 .bind(tx.txid.clone())
                 .bind(status)
@@ -1399,6 +1438,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 .bind(tx.version as i64)
                 .bind(tx.lock_time)
                 .bind(if tx.is_outgoing { 1i64 } else { 0 })
+                .bind(proof_fk)
                 .bind(tx.created_at)
                 .bind(tx.updated_at)
                 .execute(self.db)
