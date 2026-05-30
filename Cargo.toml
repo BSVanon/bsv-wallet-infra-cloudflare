@@ -12,13 +12,17 @@ categories = ["web-programming", "cryptography"]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# BRC-31 auth + BRC-29 payment middleware (published from
-# https://github.com/Calhooon/bsv-middleware-cloudflare). Aliased to
-# `bsv-auth-cloudflare` so the source's `use bsv_auth_cloudflare::...`
-# imports keep working — the package was renamed when published.
-bsv-auth-cloudflare = { package = "bsv-middleware-cloudflare", version = "0.1.2" }
+# BRC-31 auth + BRC-29 payment middleware. Forked at BSVanon with two
+# additions on top of Calhoon's feat/pluggable-session-storage: a
+# `D1SessionStorage` impl of the `SessionStorage` trait + a 30s debounce
+# on the per-message `update_session` write. Together these eliminate
+# the per-request Workers-KV writes that hit the free-tier 1k/day cap
+# under storage-sync. Aliased to `bsv-auth-cloudflare` so the source's
+# `use bsv_auth_cloudflare::...` imports keep working — the package was
+# renamed when published. Local path patch below pins the fork.
+bsv-auth-cloudflare = { package = "bsv-middleware-cloudflare", version = "0.2.0" }
 bsv-sdk = { package = "bsv-rs", version = "0.3", features = ["auth", "wallet", "transaction", "wasm"] }
-worker = { version = "0.7", features = ["d1"] }
+worker = { version = "0.8", features = ["d1"] }
 serde-wasm-bindgen = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -34,3 +38,10 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
+
+# Override the crates.io `bsv-middleware-cloudflare` with the BSVanon fork's
+# local path so the worker picks up D1SessionStorage + the 30s update_session
+# debounce. Until we publish 0.2.x to crates.io, this patch is what makes
+# `bsv-auth-cloudflare` above resolve to our fork's tree.
+[patch.crates-io]
+bsv-middleware-cloudflare = { path = "../bsv-middleware-cloudflare" }

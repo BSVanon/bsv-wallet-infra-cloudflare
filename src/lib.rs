@@ -23,10 +23,11 @@ pub mod types;
 
 use bsv_auth_cloudflare::{
     add_cors_headers, init_panic_hook,
-    middleware::{
-        auth::handle_cors_preflight, process_auth, sign_json_response, AuthMiddlewareOptions,
-        AuthResult,
+    middleware::auth::{
+        handle_cors_preflight, process_auth_with_storage, sign_json_response,
+        AuthMiddlewareOptions, AuthResult,
     },
+    storage::D1SessionStorage,
 };
 use worker::*;
 
@@ -198,16 +199,26 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .map_err(|e| Error::from(format!("SERVER_PRIVATE_KEY not set: {}", e)))?
         .to_string();
 
-    // Auth options — all requests require authentication
+    // Auth options — all requests require authentication. The 30s debounce
+    // on the per-message update_session write is the middleware default —
+    // explicit here so the trade-off is documented at the call site.
     let auth_options = AuthMiddlewareOptions {
         server_private_key: server_key,
         allow_unauthenticated: false,
         session_ttl_seconds: 3600,
+        session_touch_debounce_seconds: 30,
         ..Default::default()
     };
 
-    // Process auth (handles BRC-31 handshake + session validation)
-    let auth_result = process_auth(req, &env, &auth_options)
+    // Process auth (handles BRC-31 handshake + session validation). Sessions
+    // ride in the same D1 database as the wallet-infra data — no Workers KV
+    // namespace required (the `auth_sessions` table lives alongside the
+    // existing schema; migration `0002_auth_sessions.sql` provisions it).
+    let auth_db = env
+        .d1("DB")
+        .map_err(|e| Error::from(format!("D1 binding `DB` not bound: {}", e)))?;
+    let session_storage = D1SessionStorage::new(&auth_db, auth_options.session_ttl_seconds);
+    let auth_result = process_auth_with_storage(req, &session_storage, &auth_options)
         .await
         .map_err(|e| Error::from(e.to_string()))?;
 
