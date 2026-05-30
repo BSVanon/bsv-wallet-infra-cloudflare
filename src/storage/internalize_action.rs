@@ -303,7 +303,21 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                     }
                 }
                 BASKET_INSERTION_PROTOCOL => {
-                    if od.existing_basket_id == Some(change_basket_id) && od.existing_is_change {
+                    if od.existing_output_id.is_none() {
+                        // 2026-05-30 fix (Robert iPhone QA — receive-pool
+                        // `+0 sats` activity-row bug, parity with native
+                        // sqlx + wasm internalize_action):
+                        // a brand-new external output landing in a custom
+                        // basket grows the wallet's spendable balance.
+                        // Without this branch, receive-pool address-watched
+                        // inbound (the only path for sends from another
+                        // wallet to one of this wallet's Receive addresses)
+                        // recorded `satoshis = 0` on the transactions row,
+                        // surfacing as `+0 sats` in `list_actions`.
+                        net_satoshis += od.satoshis as i64;
+                    } else if od.existing_basket_id == Some(change_basket_id)
+                        && od.existing_is_change
+                    {
                         net_satoshis -= od.satoshis as i64;
                     }
                 }
