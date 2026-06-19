@@ -220,7 +220,7 @@ fn process_broadcast_response(
         return Err(BroadcastResponseError::DoubleSpend(format!(
             "ARC {} : {}",
             status,
-            &text[..std::cmp::min(200, text.len())]
+            super::truncate_str(text, 200)
         )));
     }
 
@@ -229,13 +229,13 @@ fn process_broadcast_response(
             return Err(BroadcastResponseError::DoubleSpend(format!(
                 "ARC {} : {}",
                 status,
-                &text[..std::cmp::min(200, text.len())]
+                super::truncate_str(text, 200)
             )));
         }
         return Err(BroadcastResponseError::InvalidTx(format!(
             "ARC {} : {}",
             status,
-            &text[..std::cmp::min(200, text.len())]
+            super::truncate_str(text, 200)
         )));
     }
 
@@ -244,20 +244,20 @@ fn process_broadcast_response(
             return Err(BroadcastResponseError::DoubleSpend(format!(
                 "ARC {} : {}",
                 status,
-                &text[..std::cmp::min(200, text.len())]
+                super::truncate_str(text, 200)
             )));
         }
         if is_invalid_tx_body(text) {
             return Err(BroadcastResponseError::InvalidTx(format!(
                 "ARC {} : {}",
                 status,
-                &text[..std::cmp::min(200, text.len())]
+                super::truncate_str(text, 200)
             )));
         }
         return Err(BroadcastResponseError::TryNext(format!(
             "ARC {} : {}",
             status,
-            &text[..std::cmp::min(200, text.len())]
+            super::truncate_str(text, 200)
         )));
     }
 
@@ -265,7 +265,7 @@ fn process_broadcast_response(
         return Err(BroadcastResponseError::TryNext(format!(
             "ARC {} : {}",
             status,
-            &text[..std::cmp::min(200, text.len())]
+            super::truncate_str(text, 200)
         )));
     }
 
@@ -314,7 +314,7 @@ fn process_proof_response(
         return Err(format!(
             "ARC proof API error {}: {}",
             http_status,
-            &text[..std::cmp::min(200, text.len())]
+            super::truncate_str(text, 200)
         ));
     }
 
@@ -407,7 +407,7 @@ async fn arc_broadcast_with_failover(
                         worker::console_log!(
                             "BENCH arc.post_tx[{}]: try_next ({})",
                             host,
-                            &msg[..msg.len().min(80)]
+                            super::truncate_str(&msg, 80)
                         );
                         errors.push(format!("{}: {}", host, msg));
                     }

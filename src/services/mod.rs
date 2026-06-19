@@ -9,6 +9,26 @@ pub mod chaintracker;
 pub mod multi;
 pub mod woc;
 
+/// Truncate `s` to at most `max` BYTES, snapping DOWN to a UTF-8 char boundary
+/// so the slice can never panic on an arbitrary upstream body.
+///
+/// Byte-indexed slicing (`&s[..max]`) panics with "byte index N is not a char
+/// boundary" when `max` lands inside a multi-byte codepoint. In wasm that panic
+/// is an uncaught trap → Cloudflare error 1101 / HTTP 500. ARC and WoC error
+/// bodies are arbitrary (HTML rate-limit pages, non-ASCII JSON), so every
+/// truncation of an upstream body MUST go through this helper rather than a raw
+/// `&body[..cmp::min(N, body.len())]`.
+pub(crate) fn truncate_str(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 // =============================================================================
 // Broadcast types
 // =============================================================================

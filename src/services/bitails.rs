@@ -202,7 +202,7 @@ async fn fetch_bitails_tsc_proof(
     }
     Err(format!(
         "failed to parse bitails tsc proof: unexpected shape (first 120 bytes = {:?})",
-        &text[..text.len().min(120)]
+        super::truncate_str(&text, 120)
     ))
 }
 

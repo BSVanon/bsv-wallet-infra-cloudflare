@@ -163,7 +163,7 @@ impl BroadcastService for WocProvider {
             return Err(BroadcastError::ServiceError(format!(
                 "WoC {} : {}",
                 status,
-                &text[..std::cmp::min(200, text.len())]
+                super::truncate_str(&text, 200)
             )));
         }
 
@@ -186,7 +186,7 @@ impl BroadcastService for WocProvider {
                 return Err(BroadcastError::DoubleSpend(format!(
                     "WoC {} : {}",
                     status,
-                    &text[..std::cmp::min(200, text.len())]
+                    super::truncate_str(&text, 200)
                 )));
             }
             if lower.contains("mandatory-script-verify-flag-failed")
@@ -196,14 +196,14 @@ impl BroadcastService for WocProvider {
                 return Err(BroadcastError::InvalidTx(format!(
                     "WoC {} : {}",
                     status,
-                    &text[..std::cmp::min(200, text.len())]
+                    super::truncate_str(&text, 200)
                 )));
             }
             // Unknown 4xx -- treat as transient (WoC rate-limits, etc.)
             return Err(BroadcastError::ServiceError(format!(
                 "WoC {} : {}",
                 status,
-                &text[..std::cmp::min(200, text.len())]
+                super::truncate_str(&text, 200)
             )));
         }
 
@@ -211,7 +211,7 @@ impl BroadcastService for WocProvider {
         Err(BroadcastError::ServiceError(format!(
             "WoC unexpected status {}: {}",
             status,
-            &text[..std::cmp::min(200, text.len())]
+            super::truncate_str(&text, 200)
         )))
     }
 
@@ -582,7 +582,7 @@ async fn fetch_tsc_proof(
         }
         if status >= 400 {
             let body = response.text().await.unwrap_or_default();
-            worker::console_log!("WoC TSC proof {}: HTTP {} body={} has_key={}", txid, status, &body[..body.len().min(120)], has_key);
+            worker::console_log!("WoC TSC proof {}: HTTP {} body={} has_key={}", txid, status, super::truncate_str(&body, 120), has_key);
             return Err(format!("WoC proof API error {}", status));
         }
 
@@ -594,7 +594,7 @@ async fn fetch_tsc_proof(
                     "WoC TSC proof {}: 200 but parsed as empty — body len={} preview={:?}",
                     txid,
                     text.len(),
-                    &text[..text.len().min(80)]
+                    super::truncate_str(&text, 80)
                 );
             } else if v.len() > 1 {
                 worker::console_log!(

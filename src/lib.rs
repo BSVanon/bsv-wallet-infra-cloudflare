@@ -218,9 +218,19 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .d1("DB")
         .map_err(|e| Error::from(format!("D1 binding `DB` not bound: {}", e)))?;
     let session_storage = D1SessionStorage::new(&auth_db, auth_options.session_ttl_seconds);
-    let auth_result = process_auth_with_storage(req, &session_storage, &auth_options)
-        .await
-        .map_err(|e| Error::from(e.to_string()))?;
+    // Bound the auth phase (body read + D1 session lookup/touch). A stalled D1
+    // subrequest here is the captured cpuTime=0 "hung" 1101; the deadline turns
+    // it into a clean retryable 503 instead of a Worker hang. See with_deadline.
+    let auth_result = match with_deadline(process_auth_with_storage(
+        req,
+        &session_storage,
+        &auth_options,
+    ))
+    .await
+    {
+        Some(r) => r.map_err(|e| Error::from(e.to_string()))?,
+        None => return Ok(timeout_response()),
+    };
 
     let (auth_context, req, session, request_body) = match auth_result {
         AuthResult::Authenticated {
@@ -321,18 +331,64 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // Build auth ID from BRC-31 context
     let auth = AuthId::new(&auth_context.identity_key);
 
-    // Dispatch
-    let result = dispatch::dispatch(
+    // Dispatch — bounded by the same request deadline so a stalled method-level
+    // D1 op also degrades to a clean retryable error rather than a Worker hang.
+    let result = match with_deadline(dispatch::dispatch(
         &mut storage,
         &rpc_request.method,
         rpc_request.params,
         rpc_request.id,
         Some(&auth),
-    )
-    .await;
+    ))
+    .await
+    {
+        Some(r) => r,
+        None => return Ok(timeout_response()),
+    };
 
     // Return signed JSON-RPC response
     sign_json_response(&result, 200, &[], &session).map_err(|e| Error::from(e.to_string()))
+}
+
+/// Wall-clock ceiling for a single authenticated request's auth + dispatch
+/// phases. A stalled D1 subrequest (or any never-resolving await) past this is
+/// abandoned and turned into a clean, retryable HTTP error instead of hanging
+/// the Worker until Cloudflare kills it as "hung" (error 1101 / HTTP 500). It
+/// sits far above normal D1 latency (~50 ms) yet below Cloudflare's hang
+/// cutoff, so it only fires on a genuine stall. The pending timer also keeps
+/// the event loop non-empty, so CF never trips its "would never generate a
+/// response" detector (the exact signature captured on the live tail).
+const REQUEST_DEADLINE_SECS: u64 = 12;
+
+/// Race `fut` against the request deadline. Returns `Some(out)` if it finished
+/// in time, `None` if the deadline fired first (the stalled future is dropped).
+async fn with_deadline<F: std::future::Future>(fut: F) -> Option<F::Output> {
+    let timeout = async {
+        Delay::from(std::time::Duration::from_secs(REQUEST_DEADLINE_SECS)).await;
+    };
+    futures_util::pin_mut!(fut);
+    futures_util::pin_mut!(timeout);
+    match futures_util::future::select(fut, timeout).await {
+        futures_util::future::Either::Left((out, _)) => Some(out),
+        futures_util::future::Either::Right(_) => None,
+    }
+}
+
+/// Transient error returned when a request exceeds the deadline. Mirrors the
+/// plain (unsigned) HTTP error the canonical auth-express-middleware returns on
+/// its failure paths (401/500), which the wallet's AuthFetch transport retries.
+/// HTTP 503 signals "transient — retry".
+fn timeout_response() -> Response {
+    let body = serde_json::json!({
+        "status": "error",
+        "code": "ERR_TIMEOUT",
+        "description": "Storage request timed out; please retry."
+    });
+    match Response::from_json(&body) {
+        Ok(resp) => add_cors_headers(resp.with_status(503)),
+        Err(_) => Response::error("timeout", 503)
+            .unwrap_or_else(|_| Response::empty().unwrap()),
+    }
 }
 
 #[event(scheduled)]
