@@ -259,24 +259,55 @@ pub struct SyncOffset {
     pub offset: u32,
 }
 
+/// JSON wire shape contract — every `Option<...>` field uses
+/// `#[serde(skip_serializing_if = "Option::is_none")]` so that None
+/// serializes as ABSENT, not as `null`.
+///
+/// Why: canonical TS `@bsv/wallet-toolbox-client` consumes our chunks
+/// at `EntitySyncState.processSyncChunk` and does
+/// `if (me.stateArray === undefined || me.stateArray.length > 0)` —
+/// it checks `=== undefined` but does NOT null-check. So when a chunk
+/// field round-trips as JSON `null`, the subsequent `.length` access
+/// null-pointers. Empirically reproduced 2026-06-05: Robert tried
+/// adding `storage.sendbsv.com` as a bsv-desktop backup; the toast
+/// said `Storage method processSyncChunk failed: Cannot read properties
+/// of null (reading 'length')`.
+///
+/// Mirror fix landed in `bsv-wallet-toolbox-rs` `src/storage/traits.rs`
+/// (commit `119e795`). Upstream Calhoon PR queued to null-check the TS
+/// side; this server-side change is the more conservative interop fix
+/// that ships independently.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncChunk {
     pub from_storage_identity_key: String,
     pub to_storage_identity_key: String,
     pub user_identity_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<TableUser>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub proven_txs: Option<Vec<TableProvenTx>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub proven_tx_reqs: Option<Vec<TableProvenTxReq>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_baskets: Option<Vec<TableOutputBasket>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_labels: Option<Vec<TableTxLabel>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tags: Option<Vec<TableOutputTag>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub transactions: Option<Vec<TableTransaction>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_label_maps: Option<Vec<TableTxLabelMap>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub commissions: Option<Vec<TableCommission>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub outputs: Option<Vec<TableOutput>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tag_maps: Option<Vec<TableOutputTagMap>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub certificates: Option<Vec<TableCertificate>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub certificate_fields: Option<Vec<TableCertificateField>>,
 }
 
