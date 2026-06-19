@@ -169,7 +169,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             "api_key_len": woc_key.as_ref().map(|k| k.len()),
             "status": status,
             "body_len": body.len(),
-            "body_preview": &body[..body.len().min(500)],
+            "body_preview": crate::services::truncate_str(&body, 500),
         }))?));
     }
 
@@ -331,20 +331,22 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // Build auth ID from BRC-31 context
     let auth = AuthId::new(&auth_context.identity_key);
 
-    // Dispatch — bounded by the same request deadline so a stalled method-level
-    // D1 op also degrades to a clean retryable error rather than a Worker hang.
-    let result = match with_deadline(dispatch::dispatch(
+    // Dispatch is deliberately NOT wrapped in with_deadline (Codex c76dc789
+    // HIGH): dispatch exposes mutation methods (createAction locks UTXOs +
+    // inserts rows) and this D1 port has no transactions, so its abort_action
+    // cleanup runs only on Err — NOT when the future is dropped by a timeout.
+    // Deadline-dropping a mid-flight write could commit partial state / leave
+    // outputs locked, then the client retries the same mutation. The bound
+    // belongs only on the read-mostly auth phase above (where the captured
+    // cpuTime=0 hang actually occurred — before any signature-verify CPU).
+    let result = dispatch::dispatch(
         &mut storage,
         &rpc_request.method,
         rpc_request.params,
         rpc_request.id,
         Some(&auth),
-    ))
-    .await
-    {
-        Some(r) => r,
-        None => return Ok(timeout_response()),
-    };
+    )
+    .await;
 
     // Return signed JSON-RPC response
     sign_json_response(&result, 200, &[], &session).map_err(|e| Error::from(e.to_string()))
