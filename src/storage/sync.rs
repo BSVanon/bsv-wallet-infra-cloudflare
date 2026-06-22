@@ -1750,10 +1750,30 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         let Some(bytes) = data else { return Ok(()) };
         let store = crate::r2::BlobStore::new(self.blobs);
         let (d1_value, _in_r2) = store.put(table, id, column, bytes).await?;
+        // FUNDS-SAFE FILL-IF-EMPTY (2026-06-22, Codex 1df06d5f) — every blob
+        // column routed through here (locking_script, raw_tx, input_beef) is
+        // IMMUTABLE per row/outpoint. The funds-safe pull guard protects the
+        // scalar fundability columns, but a stale-but-newer push could still
+        // poison a populated immutable blob and that poisoned script/tx would be
+        // rehydrated into a future restore's sync chunk. Guard the column write
+        // with `AND (column IS NULL OR length(column) = 0)` so the blob is only
+        // written to FILL an empty value (insert + the input_beef back-fill),
+        // never to OVERWRITE a populated one. (The R2 object is still put; the
+        // D1 column keeps its original pointer when the WHERE no-ops — a tiny
+        // orphan, not a corruption.)
+        let pk = table_pk_prefix(table);
         let sql = if also_updated {
-            format!("UPDATE {} SET {} = ?, updated_at = ? WHERE {}_id = ?", table, column, table_pk_prefix(table))
+            format!(
+                "UPDATE {t} SET {c} = ?, updated_at = ? WHERE {pk}_id = ? \
+                 AND ({c} IS NULL OR length({c}) = 0)",
+                t = table, c = column, pk = pk
+            )
         } else {
-            format!("UPDATE {} SET {} = ? WHERE {}_id = ?", table, column, table_pk_prefix(table))
+            format!(
+                "UPDATE {t} SET {c} = ? WHERE {pk}_id = ? \
+                 AND ({c} IS NULL OR length({c}) = 0)",
+                t = table, c = column, pk = pk
+            )
         };
         let mut q = Query::new(sql).bind(d1_value);
         if also_updated {
