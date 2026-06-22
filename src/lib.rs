@@ -348,8 +348,29 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     )
     .await;
 
+    // FINDING-B FIX (bughunt wix7h0f2k, 2026-06-22): a runtime D1/R2 fault is
+    // transient infrastructure, NOT a deterministic JSON-RPC application error.
+    // dispatch maps DatabaseError/InternalError to code -32603; surface those as
+    // HTTP 503 so the client's existing 5xx-retriable path fires (previously a
+    // D1 blip came back as 200-OK -32603 — indistinguishable from a deterministic
+    // validation error, so the client never retried the dominant transient
+    // failure). The dispatch already ran to completion here (we only choose the
+    // status), and the sync upserts are idempotent (compare-updated_at /
+    // no-delete / fill-if-empty), so a retry re-applies cleanly. Deterministic
+    // codes (-32602 validation, -32001 not-found) stay HTTP 200.
+    let http_status = if result
+        .get("error")
+        .and_then(|e| e.get("code"))
+        .and_then(|c| c.as_i64())
+        == Some(-32603)
+    {
+        503
+    } else {
+        200
+    };
     // Return signed JSON-RPC response
-    sign_json_response(&result, 200, &[], &session).map_err(|e| Error::from(e.to_string()))
+    sign_json_response(&result, http_status, &[], &session)
+        .map_err(|e| Error::from(e.to_string()))
 }
 
 /// Wall-clock ceiling for a single authenticated request's auth + dispatch
