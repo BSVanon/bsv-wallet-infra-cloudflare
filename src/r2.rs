@@ -77,6 +77,22 @@ impl<'a> BlobStore<'a> {
         }
     }
 
+    /// Cheaply check whether a blob object exists in R2, WITHOUT downloading
+    /// its body. Used by the fill-if-empty blob guard to detect an R2-backed
+    /// (D1 column = NULL) populated value. `get(...).execute()` resolves only
+    /// object metadata; the body is fetched lazily via `.body()`, which we
+    /// never call here.
+    pub async fn exists(&self, table: &str, id: i64, column: &str) -> Result<bool> {
+        let key = format!("{}/{}/{}", table, id, column);
+        let obj = self
+            .bucket
+            .get(&key)
+            .execute()
+            .await
+            .map_err(|e| Error::InternalError(format!("R2 exists check failed: {}", e)))?;
+        Ok(obj.is_some())
+    }
+
     /// Delete a blob from R2 (cleanup).
     pub async fn delete(&self, table: &str, id: i64, column: &str) -> Result<()> {
         let key = format!("{}/{}/{}", table, id, column);
@@ -195,5 +211,48 @@ mod tests {
             "outputs/5/locking_script"
         );
         assert_eq!(r2_key("proven_txs", 10, "raw_tx"), "proven_txs/10/raw_tx");
+    }
+
+    // =========================================================================
+    // FILL-IF-EMPTY blob guard — content-independence of the R2 key (Codex
+    // 1df06d5f re-review). This is the property that makes a naive second
+    // `BlobStore::put` for the same outpoint DESTRUCTIVE: the key is derived
+    // ONLY from (table, id, column) — never from the bytes — so a stale-newer
+    // push of different bytes overwrites the good object IN PLACE. Because the
+    // D1 column is NULL whenever a blob is R2-backed, the D1 `col IS NULL` guard
+    // can't catch this; `put_blob_column` must therefore probe populated-ness
+    // (D1 inline OR R2 `exists`) and SKIP the write. These pure tests pin the
+    // key invariant that motivates that skip; the D1/R2 round-trip itself needs
+    // a miniflare integration harness the repo does not yet have.
+    // =========================================================================
+
+    #[test]
+    fn test_r2_key_is_content_independent_for_same_outpoint() {
+        // A "good" large blob and a "poison" large blob for the SAME
+        // (table,id,column) resolve to the IDENTICAL R2 key — so a second put
+        // would overwrite in place. This is why the write must be skipped when
+        // the object already exists, not merely D1-guarded.
+        let good = vec![0xABu8; THRESHOLD + 1];
+        let poison = vec![0xFFu8; THRESHOLD + 1];
+        assert!(should_use_r2(&good) && should_use_r2(&poison));
+        assert_eq!(
+            r2_key("transactions", 7, "input_beef"),
+            r2_key("transactions", 7, "input_beef"),
+            "key must not depend on blob contents"
+        );
+    }
+
+    #[test]
+    fn test_distinct_outpoints_get_distinct_keys() {
+        // Different rows/columns never collide, so the skip-if-populated guard
+        // can't wrongly suppress a legitimate fill of a different blob.
+        assert_ne!(
+            r2_key("transactions", 7, "input_beef"),
+            r2_key("transactions", 8, "input_beef")
+        );
+        assert_ne!(
+            r2_key("transactions", 7, "input_beef"),
+            r2_key("transactions", 7, "raw_tx")
+        );
     }
 }

@@ -145,6 +145,13 @@ struct ExistsRow {
     updated_at: Option<String>,
 }
 
+/// One nullable column read back as `hex(...)` — used by the fill-if-empty blob
+/// guard to detect an inline-populated D1 blob.
+#[derive(Debug, Deserialize)]
+struct BlobHexRow {
+    v: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct UserMergeRow {
     updated_at: Option<String>,
@@ -1748,20 +1755,48 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         also_updated: bool,
     ) -> Result<()> {
         let Some(bytes) = data else { return Ok(()) };
+        let pk = table_pk_prefix(table);
+
+        // FUNDS-SAFE FILL-IF-EMPTY (2026-06-22, Codex 1df06d5f + re-review) —
+        // every blob routed through here (locking_script, raw_tx, input_beef) is
+        // IMMUTABLE per row/outpoint. A stale-but-newer push must never poison a
+        // populated blob: fetch_*_for_sync rehydrates it into outbound sync
+        // chunks, and a fresh restore would then ingest the corruption.
+        //
+        // We decide populated-ness across BOTH storage backends BEFORE writing,
+        // and skip the write entirely (R2 put included) when already populated:
+        //   - INLINE (<= r2::THRESHOLD): the value lives in the D1 column;
+        //     `hex(col)` returns non-empty.
+        //   - R2-BACKED (> THRESHOLD): the D1 column is NULL and the bytes live
+        //     in R2 under the DETERMINISTIC key `{table}/{id}/{column}`. A plain
+        //     `store.put` would overwrite that object IN PLACE, and the D1
+        //     `col IS NULL` guard can't catch it (NULL is the normal R2-backed
+        //     state). So we must probe R2 directly.
+        // The trailing `AND (col IS NULL OR length(col)=0)` on the D1 UPDATE is
+        // kept as belt-and-suspenders against a concurrent fill.
+        let already_populated = {
+            let hex_row: Option<BlobHexRow> = Query::new(format!(
+                "SELECT hex({c}) AS v FROM {t} WHERE {pk}_id = ?",
+                t = table,
+                c = column,
+                pk = pk
+            ))
+            .bind(id)
+            .fetch_optional(self.db)
+            .await?;
+            match hex_row.and_then(|r| r.v) {
+                Some(h) if !h.is_empty() => true, // inline, populated
+                _ => crate::r2::BlobStore::new(self.blobs)
+                    .exists(table, id, column)
+                    .await?, // D1 NULL → probe R2
+            }
+        };
+        if already_populated {
+            return Ok(());
+        }
+
         let store = crate::r2::BlobStore::new(self.blobs);
         let (d1_value, _in_r2) = store.put(table, id, column, bytes).await?;
-        // FUNDS-SAFE FILL-IF-EMPTY (2026-06-22, Codex 1df06d5f) — every blob
-        // column routed through here (locking_script, raw_tx, input_beef) is
-        // IMMUTABLE per row/outpoint. The funds-safe pull guard protects the
-        // scalar fundability columns, but a stale-but-newer push could still
-        // poison a populated immutable blob and that poisoned script/tx would be
-        // rehydrated into a future restore's sync chunk. Guard the column write
-        // with `AND (column IS NULL OR length(column) = 0)` so the blob is only
-        // written to FILL an empty value (insert + the input_beef back-fill),
-        // never to OVERWRITE a populated one. (The R2 object is still put; the
-        // D1 column keeps its original pointer when the WHERE no-ops — a tiny
-        // orphan, not a corruption.)
-        let pk = table_pk_prefix(table);
         let sql = if also_updated {
             format!(
                 "UPDATE {t} SET {c} = ?, updated_at = ? WHERE {pk}_id = ? \
