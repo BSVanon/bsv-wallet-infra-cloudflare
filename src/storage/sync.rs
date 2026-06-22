@@ -1480,8 +1480,18 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         if let Some(row) = existing {
             let local_id = row.id.map(|v| v as i64).unwrap_or(0);
             if o.updated_at > parse_datetime_pub(&row.updated_at) {
-                Query::new("UPDATE outputs SET transaction_id = ?, basket_id = ?, satoshis = ?, script_length = ?, script_offset = ?, type = ?, spendable = ?, change = ?, derivation_prefix = ?, derivation_suffix = ?, sender_identity_key = ?, custom_instructions = ?, updated_at = ? WHERE output_id = ?")
+                // FUNDS-SAFE PULL GUARD (2026-06-22, Codex 23bf18dd) — mirror of
+                // the wasm client guard. A push must be funds-monotonic on the
+                // backup: never demote an existing output's fundability
+                // (spendable 1→0, change 1→0, basket out of `default`) nor
+                // overwrite a populated immutable scalar; only ADD/PROMOTE. Each
+                // CASE reads the PRE-update row. (locking_script is written via
+                // put_blob_column below and is immutable per (txid,vout) — a
+                // stale overwrite of the same outpoint is a practical no-op; the
+                // client side fully guards the funds-loss-facing direction.)
+                Query::new("UPDATE outputs SET transaction_id = ?, basket_id = CASE WHEN basket_id = (SELECT basket_id FROM output_baskets WHERE user_id = ? AND name = 'default') THEN basket_id ELSE ? END, satoshis = CASE WHEN satoshis = 0 THEN ? ELSE satoshis END, script_length = CASE WHEN locking_script IS NULL OR length(locking_script) = 0 THEN ? ELSE script_length END, script_offset = CASE WHEN locking_script IS NULL OR length(locking_script) = 0 THEN ? ELSE script_offset END, type = ?, spendable = CASE WHEN spendable = 1 THEN 1 ELSE ? END, change = CASE WHEN change = 1 THEN 1 ELSE ? END, derivation_prefix = CASE WHEN derivation_prefix IS NULL THEN ? ELSE derivation_prefix END, derivation_suffix = CASE WHEN derivation_suffix IS NULL THEN ? ELSE derivation_suffix END, sender_identity_key = ?, custom_instructions = ?, updated_at = ? WHERE output_id = ?")
                     .bind(tx_id)
+                    .bind(user_id)
                     .bind(local_basket_id)
                     .bind(o.satoshis)
                     .bind(o.script_length as i64)
