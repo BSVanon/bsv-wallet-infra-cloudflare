@@ -9,6 +9,7 @@ pub mod process_action;
 pub mod readers;
 pub mod relinquish_output;
 pub mod sync;
+pub mod sync_apply;
 pub mod writers;
 
 use worker::{Bucket, D1Database};

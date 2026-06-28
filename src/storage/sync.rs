@@ -522,7 +522,8 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
     /// (upsert by natural key; newer-wins on `updated_at`). Returns counts +
     /// `done=true` when the chunk carries no entity rows beyond the user record
     /// (the loop-termination signal the wallet's orchestrator waits for).
-    pub async fn process_sync_chunk(
+    #[allow(dead_code)] // superseded by storage::sync_apply (F4 batched path); kept for reference until F4 is verified in prod.
+    async fn process_sync_chunk_legacy(
         &self,
         user_id: i64,
         args: RequestSyncChunkArgs,
@@ -1193,7 +1194,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
     // Upsert helpers (process_sync_chunk) — newer-wins by natural key
     // =========================================================================
 
-    async fn merge_user(&self, user_id: i64, chunk_user: &TableUser) -> Result<bool> {
+    pub(crate) async fn merge_user(&self, user_id: i64, chunk_user: &TableUser) -> Result<bool> {
         let current: Option<UserMergeRow> =
             Query::new("SELECT updated_at FROM users WHERE user_id = ?")
                 .bind(user_id)
@@ -1745,7 +1746,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
     /// Store a nullable overflow blob column via the two-phase pattern: small
     /// blobs go inline in D1, large (>4KB) overflow to R2 with the column NULL.
     /// `also_updated` controls whether to also stamp `updated_at` in the UPDATE.
-    async fn put_blob_column(
+    pub(crate) async fn put_blob_column(
         &self,
         table: &str,
         id: i64,
