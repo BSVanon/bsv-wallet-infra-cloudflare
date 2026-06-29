@@ -2,9 +2,11 @@
 //!
 //! D1 has no interactive transaction, only `batch()`. The original port
 //! (sync.rs) reproduced the canonical merge LOGIC but executed it as ~2N
-//! sequential round-trips + per-blob R2 ops, which on a large chunk exceeds the
-//! Worker subrequest/CPU budget → Error 1102 → HTTP 503 (the wallet "freeze"
-//! root cause). This module restores canonical's "one atomic unit" using D1
+//! sequential round-trips + per-blob R2 ops, which on a large chunk exceeds CF's
+//! 1000-subrequest-per-invocation budget → HTTP 503 "Too many API requests by a
+//! single Worker invocation" (proven live 2026-06-29: one output-heavy chunk
+//! made ~1500 sequential D1/R2 calls). This module restores canonical's "one
+//! atomic unit" using D1
 //! `batch()`: each entity is an `INSERT … ON CONFLICT(natural_key) DO UPDATE …
 //! RETURNING <pk>` collected into phase batches, in the SAME dependency order
 //! as the engine (`bsv-wallet-toolbox-rs/src/storage/sqlx/sync.rs`).
@@ -18,9 +20,14 @@
 //!    pin, fill-if-empty) is translated 1:1 from the original UPDATE at
 //!    sync.rs:1499;
 //!  - the never-NULL proof-link guard on transactions is preserved;
-//!  - blobs continue to flow through the UNCHANGED, proven `put_blob_column`
-//!    (fill-if-empty / immutable / R2-correct) — only the row upserts are
-//!    batched here. Batching the blob path is a measured fast-follow (V3).
+//!  - F7-2 blob handling: INLINE blobs (<= r2 THRESHOLD — the common case, e.g.
+//!    P2PKH locking_script) are FOLDED into the batched upsert via a fill-if-empty
+//!    + newer-wins CASE (`nw_blob`/`inline_blob_bind`), so an output-heavy chunk
+//!    costs O(1) subrequests instead of ~3/row (the 503). Only OVER-threshold
+//!    blobs still use `put_blob_column` (R2 put is an irreducible subrequest), and
+//!    those are bounded per chunk by the producer's rough-size cap. The inline
+//!    CASE preserves the same fail-closed immutability as `put_blob_column`
+//!    (proven in tests/f7_inline_blob_proof.py; routing in f7_routing_tests).
 
 use std::collections::HashMap;
 
@@ -115,7 +122,9 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 .await?;
             // input_beef blob via the proven put_blob_column (fill-if-empty).
             for (req, id) in reqs.iter().zip(ids) {
-                self.put_blob_column("proven_tx_reqs", id, "input_beef", req.input_beef.as_deref(), req.updated_at, false).await?;
+                if needs_r2_fill(req.input_beef.as_deref()) {
+                    self.put_blob_column("proven_tx_reqs", id, "input_beef", req.input_beef.as_deref(), req.updated_at, false).await?;
+                }
                 update_max(&mut result.max_updated_at, req.updated_at);
                 result.inserts += 1;
             }
@@ -185,8 +194,12 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             let ids = self.run_upserts(queries).await?;
             for (tx, id) in txs.iter().zip(ids) {
                 transaction_id_map.insert(tx.transaction_id, id);
-                self.put_blob_column("transactions", id, "raw_tx", tx.raw_tx.as_deref(), tx.updated_at, false).await?;
-                self.put_blob_column("transactions", id, "input_beef", tx.input_beef.as_deref(), tx.updated_at, false).await?;
+                if needs_r2_fill(tx.raw_tx.as_deref()) {
+                    self.put_blob_column("transactions", id, "raw_tx", tx.raw_tx.as_deref(), tx.updated_at, false).await?;
+                }
+                if needs_r2_fill(tx.input_beef.as_deref()) {
+                    self.put_blob_column("transactions", id, "input_beef", tx.input_beef.as_deref(), tx.updated_at, false).await?;
+                }
                 update_max(&mut result.max_updated_at, tx.updated_at);
                 result.inserts += 1;
             }
@@ -217,7 +230,9 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             let ids = self.run_upserts(queries).await?;
             for (o, id) in included.into_iter().zip(ids) {
                 output_id_map.insert(o.output_id, id);
-                self.put_blob_column("outputs", id, "locking_script", o.locking_script.as_deref(), o.updated_at, false).await?;
+                if needs_r2_fill(o.locking_script.as_deref()) {
+                    self.put_blob_column("outputs", id, "locking_script", o.locking_script.as_deref(), o.updated_at, false).await?;
+                }
                 update_max(&mut result.max_updated_at, o.updated_at);
                 result.inserts += 1;
             }
@@ -391,6 +406,38 @@ fn nw(t: &str, c: &str) -> String {
     format!("{c} = CASE WHEN excluded.updated_at > {t}.updated_at THEN excluded.{c} ELSE {t}.{c} END")
 }
 
+/// F7-2: fill-if-empty + newer-wins CASE for an IMMUTABLE blob column. Only
+/// overwrites when the existing value is NULL/empty AND the incoming row is
+/// strictly newer — the exact fail-closed immutability `put_blob_column`
+/// enforces for the inline (D1) case, so a stale-but-newer push can never poison
+/// a populated blob.
+fn nw_blob(t: &str, c: &str) -> String {
+    format!(
+        "{c} = CASE WHEN ({t}.{c} IS NULL OR length({t}.{c})=0) AND excluded.updated_at > {t}.updated_at \
+         THEN excluded.{c} ELSE {t}.{c} END"
+    )
+}
+
+/// F7-2: the value to bind for a blob column in the BATCHED upsert. An
+/// inline-sized blob (<= r2 THRESHOLD) is folded into the batch (`Some`) so it
+/// costs ZERO extra subrequests; an over-threshold blob binds NULL here and is
+/// written to R2 afterward by `put_blob_column`. A missing blob binds NULL.
+/// This is what keeps an output-heavy chunk to O(1) subrequests instead of
+/// ~3 per row (the CF 1000-subrequest-limit 503).
+fn inline_blob_bind(data: Option<&[u8]>) -> Option<Vec<u8>> {
+    match data {
+        Some(d) if !crate::r2::should_use_r2(d) => Some(d.to_vec()),
+        _ => None,
+    }
+}
+
+/// F7-2: whether this blob still needs the post-batch R2 fill — i.e. it is large
+/// enough (> THRESHOLD) to live in R2. Inline blobs are handled entirely by the
+/// batch via `inline_blob_bind`, so `put_blob_column` is skipped for them.
+fn needs_r2_fill(data: Option<&[u8]>) -> bool {
+    matches!(data, Some(d) if crate::r2::should_use_r2(d))
+}
+
 fn build_upsert_basket(user_id: i64, b: &TableOutputBasket) -> Query {
     let sql = format!(
         "INSERT INTO output_baskets (user_id, name, number_of_desired_utxos, minimum_desired_utxo_value, created_at, updated_at) \
@@ -443,8 +490,8 @@ fn build_upsert_proven_tx_req(req: &TableProvenTxReq) -> Query {
     let raw_tx = req.raw_tx.clone().unwrap_or_default();
     let sql = format!(
         "INSERT INTO proven_tx_reqs (txid, status, attempts, history, notify, notified, raw_tx, input_beef, proven_tx_id, batch, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?) \
-         ON CONFLICT(txid) DO UPDATE SET {st}, {at}, {hi}, {no}, {ny}, {rt}, {pt}, {ba}, {ua} \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(txid) DO UPDATE SET {st}, {at}, {hi}, {no}, {ny}, {rt}, {ib}, {pt}, {ba}, {ua} \
          RETURNING proven_tx_req_id AS id",
         st = nw("proven_tx_reqs", "status"),
         at = nw("proven_tx_reqs", "attempts"),
@@ -452,6 +499,7 @@ fn build_upsert_proven_tx_req(req: &TableProvenTxReq) -> Query {
         no = nw("proven_tx_reqs", "notified"),
         ny = nw("proven_tx_reqs", "notify"),
         rt = nw("proven_tx_reqs", "raw_tx"),
+        ib = nw_blob("proven_tx_reqs", "input_beef"),
         pt = nw("proven_tx_reqs", "proven_tx_id"),
         ba = nw("proven_tx_reqs", "batch"),
         ua = nw("proven_tx_reqs", "updated_at"),
@@ -464,6 +512,7 @@ fn build_upsert_proven_tx_req(req: &TableProvenTxReq) -> Query {
         .bind(req.notify.as_str())
         .bind(if req.notified { 1i64 } else { 0 })
         .bind(raw_tx)
+        .bind(inline_blob_bind(req.input_beef.as_deref()))
         .bind(req.proven_tx_id)
         .bind(req.batch.clone())
         .bind(req.created_at)
@@ -501,8 +550,8 @@ fn build_upsert_transaction(user_id: i64, tx: &TableTransaction, proof_fk: Optio
     // an existing link — only set when newer AND incoming carries a resolved fk.
     let sql = format!(
         "INSERT INTO transactions (user_id, txid, status, reference, description, satoshis, version, lock_time, is_outgoing, proven_tx_id, raw_tx, input_beef, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?) \
-         ON CONFLICT(reference) DO UPDATE SET {tx}, {st}, {de}, {sa}, {ve}, {lt}, {io}, \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(reference) DO UPDATE SET {tx}, {st}, {de}, {sa}, {ve}, {lt}, {io}, {rt}, {ib}, \
            proven_tx_id = CASE WHEN excluded.updated_at > transactions.updated_at AND excluded.proven_tx_id IS NOT NULL \
                                THEN excluded.proven_tx_id ELSE transactions.proven_tx_id END, \
            {ua} \
@@ -514,6 +563,8 @@ fn build_upsert_transaction(user_id: i64, tx: &TableTransaction, proof_fk: Optio
         ve = nw("transactions", "version"),
         lt = nw("transactions", "lock_time"),
         io = nw("transactions", "is_outgoing"),
+        rt = nw_blob("transactions", "raw_tx"),
+        ib = nw_blob("transactions", "input_beef"),
         ua = nw("transactions", "updated_at"),
     );
     Query::new(sql)
@@ -527,6 +578,8 @@ fn build_upsert_transaction(user_id: i64, tx: &TableTransaction, proof_fk: Optio
         .bind(tx.lock_time)
         .bind(if tx.is_outgoing { 1i64 } else { 0 })
         .bind(proof_fk)
+        .bind(inline_blob_bind(tx.raw_tx.as_deref()))
+        .bind(inline_blob_bind(tx.input_beef.as_deref()))
         .bind(tx.created_at)
         .bind(tx.updated_at)
 }
@@ -543,8 +596,9 @@ fn build_upsert_output(
     let provided_by = if o.provided_by.is_empty() { "you".to_string() } else { o.provided_by.clone() };
     let sql = "INSERT INTO outputs \
          (user_id, transaction_id, basket_id, txid, vout, satoshis, locking_script, script_length, script_offset, type, provided_by, purpose, spendable, change, derivation_prefix, derivation_suffix, sender_identity_key, custom_instructions, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(transaction_id, vout, user_id) DO UPDATE SET \
+           locking_script = CASE WHEN (outputs.locking_script IS NULL OR length(outputs.locking_script)=0) AND excluded.updated_at > outputs.updated_at THEN excluded.locking_script ELSE outputs.locking_script END, \
            transaction_id = CASE WHEN excluded.updated_at > outputs.updated_at THEN excluded.transaction_id ELSE outputs.transaction_id END, \
            basket_id = CASE \
                WHEN outputs.basket_id = (SELECT basket_id FROM output_baskets WHERE user_id = outputs.user_id AND name = 'default') THEN outputs.basket_id \
@@ -568,6 +622,7 @@ fn build_upsert_output(
         .bind(o.txid.as_str())
         .bind(o.vout as i64)
         .bind(o.satoshis)
+        .bind(inline_blob_bind(o.locking_script.as_deref()))
         .bind(o.script_length as i64)
         .bind(o.script_offset as i64)
         .bind(o.output_type.as_str())
@@ -688,4 +743,51 @@ fn build_upsert_commission(user_id: i64, c: &TableCommission, tx_id: i64) -> Que
         .bind(c.payer_locking_script.as_slice())
         .bind(c.created_at)
         .bind(c.updated_at)
+}
+
+// =============================================================================
+// F7-2 tests — inline-vs-R2 blob routing (Codex condition: no <=4096 blob to R2)
+// =============================================================================
+#[cfg(test)]
+mod f7_routing_tests {
+    use super::{inline_blob_bind, needs_r2_fill};
+
+    // Mirrors r2::THRESHOLD (its value is asserted by r2::tests::test_threshold_value_is_4096).
+    const THRESHOLD: usize = 4096;
+
+    #[test]
+    fn at_or_below_threshold_folds_inline_never_r2() {
+        for n in [0usize, 1, 25, THRESHOLD - 1, THRESHOLD] {
+            let data = vec![0u8; n];
+            assert!(inline_blob_bind(Some(&data)).is_some(), "<= {THRESHOLD} must fold inline (n={n})");
+            assert!(!needs_r2_fill(Some(&data)), "<= {THRESHOLD} must NOT route to R2 (n={n})");
+        }
+    }
+
+    #[test]
+    fn over_threshold_routes_to_r2_not_inline() {
+        for n in [THRESHOLD + 1, THRESHOLD * 4] {
+            let data = vec![0u8; n];
+            assert!(inline_blob_bind(Some(&data)).is_none(), "> {THRESHOLD} must NOT fold inline (n={n})");
+            assert!(needs_r2_fill(Some(&data)), "> {THRESHOLD} must route to R2 (n={n})");
+        }
+    }
+
+    #[test]
+    fn present_blob_is_exactly_one_of_inline_or_r2() {
+        // A present blob is folded inline XOR routed to R2 — never both (an inline
+        // blob can't leak to R2) and never neither (a large blob can't be dropped).
+        for n in [0usize, 25, 4096, 4097, 100_000] {
+            let data = vec![0u8; n];
+            let inline = inline_blob_bind(Some(&data)).is_some();
+            let r2 = needs_r2_fill(Some(&data));
+            assert!(inline ^ r2, "present blob must be inline XOR r2 (n={n}: inline={inline} r2={r2})");
+        }
+    }
+
+    #[test]
+    fn missing_blob_is_neither() {
+        assert!(inline_blob_bind(None).is_none());
+        assert!(!needs_r2_fill(None));
+    }
 }
