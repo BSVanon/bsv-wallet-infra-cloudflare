@@ -267,6 +267,26 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             .map_err(|e| Error::from(e.to_string()));
     }
 
+    // F6-b: reject an oversized body BEFORE the (deliberately un-deadline-wrapped)
+    // parse + dispatch. serde_json::from_slice of a 14.5 MB body OOM-aborts the
+    // 128 MB Worker, and the trap hangs the request into a CF 1101 instead of any
+    // clean status. 413 is deterministic + non-retriable, so the client's breaker
+    // fails fast with an honest signal. The producer-side fix (F6-a) keeps real
+    // chunks ~1 MB; this is the server's standing guard against a mis-sized client.
+    if request_body.len() > MAX_REQUEST_BODY_BYTES {
+        let body = serde_json::json!({
+            "status": "error",
+            "code": "ERR_PAYLOAD_TOO_LARGE",
+            "description": format!(
+                "Request body {} bytes exceeds the {}-byte limit; reduce the sync chunk size.",
+                request_body.len(),
+                MAX_REQUEST_BODY_BYTES
+            )
+        });
+        return sign_json_response(&body, 413, &[], &session)
+            .map_err(|e| Error::from(e.to_string()));
+    }
+
     // Parse JSON-RPC request
     let rpc_request: JsonRpcRequest = match serde_json::from_slice(&request_body) {
         Ok(r) => r,
@@ -382,6 +402,15 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 /// the event loop non-empty, so CF never trips its "would never generate a
 /// response" detector (the exact signature captured on the live tail).
 const REQUEST_DEADLINE_SECS: u64 = 12;
+
+/// F6-b ceiling: maximum accepted request body. A push of ~1000 blob-bearing
+/// sync rows (proven_txs.raw_tx / proven_tx_reqs.input_beef) reached 14.5 MB,
+/// which OOM-aborts the 128 MB Worker mid-parse -> the request hangs -> CF
+/// cancels it as "hung" (error 1101 / HTTP 500), tripping the client breaker
+/// for ~16 min. 8 MiB sits far above any legitimate producer-bounded chunk
+/// (~1 MB after F6-a) yet well below the OOM cliff, so a healthy sync never
+/// trips it; an over-sized or pre-F6-a client fails fast with a 413 instead.
+const MAX_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 /// Race `fut` against the request deadline. Returns `Some(out)` if it finished
 /// in time, `None` if the deadline fired first (the stalled future is dropped).
