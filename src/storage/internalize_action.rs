@@ -118,6 +118,7 @@ impl OutputRow {
             purpose: self.purpose,
             output_description: None,
             spent_by: None,
+            spent_by_reference: None,
             sequence_number: None,
             spending_description: None,
             spendable: self.spendable.map(|v| v != 0.0).unwrap_or(false),

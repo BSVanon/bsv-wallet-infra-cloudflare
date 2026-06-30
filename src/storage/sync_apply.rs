@@ -223,6 +223,14 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             // exists in D1, so resolve it by the stable name the producer now
             // carries on each output (basketName).
             let basket_name_map = self.load_basket_name_map(user_id).await?;
+            // A2-plus: resolve each output's spending tx by its stable reference
+            // (forward-only spent_by) when this chunk's per-chunk transaction map
+            // misses — the spending tx may have ridden an earlier chunk / pre-exist.
+            let spend_refs: Vec<&str> = outputs
+                .iter()
+                .filter_map(|o| o.spent_by_reference.as_deref())
+                .collect();
+            let spent_by_ref_map = self.load_tx_id_by_reference(user_id, &spend_refs).await?;
             let mut included: Vec<&TableOutput> = Vec::new();
             let mut queries: Vec<Query> = Vec::new();
             for o in outputs {
@@ -239,7 +247,17 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                             .as_deref()
                             .and_then(|n| basket_name_map.get(n).copied())
                     });
-                queries.push(build_upsert_output(user_id, o, tx_id, local_basket_id));
+                // Foreign spent_by → local via the per-chunk tx map, else the
+                // stable spent_by_reference. None → never stamp spent.
+                let local_spent_by = o
+                    .spent_by
+                    .and_then(|sid| transaction_id_map.get(&sid).copied())
+                    .or_else(|| {
+                        o.spent_by_reference
+                            .as_deref()
+                            .and_then(|r| spent_by_ref_map.get(r).copied())
+                    });
+                queries.push(build_upsert_output(user_id, o, tx_id, local_basket_id, local_spent_by));
                 included.push(o);
             }
             let ids = self.run_upserts(queries).await?;
@@ -416,6 +434,48 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         for r in rows {
             if let (Some(name), Some(id)) = (r.name, r.id) {
                 map.insert(name, id as i64);
+            }
+        }
+        Ok(map)
+    }
+
+    /// A2-plus: load a (transaction `reference` → local transaction_id) map for
+    /// the given references — the stable key used to resolve a spent output's
+    /// spending tx across chunks (mirrors `load_id_map_by_txid`, keyed by the
+    /// `transactions.reference` natural key). Forward-only spent_by relies on it
+    /// when the per-chunk transaction id-map misses.
+    async fn load_tx_id_by_reference(
+        &self,
+        user_id: i64,
+        references: &[&str],
+    ) -> Result<HashMap<String, i64>> {
+        #[derive(Deserialize)]
+        struct Row {
+            k: Option<String>,
+            id: Option<f64>,
+        }
+        let mut map: HashMap<String, i64> = HashMap::new();
+        let mut uniq: Vec<&str> = references.to_vec();
+        uniq.sort_unstable();
+        uniq.dedup();
+        for group in uniq.chunks(500) {
+            if group.is_empty() {
+                continue;
+            }
+            let placeholders = group.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "SELECT reference AS k, transaction_id AS id FROM transactions \
+                 WHERE user_id = ? AND reference IN ({placeholders})"
+            );
+            let mut q = Query::new(sql).bind(user_id);
+            for r in group {
+                q = q.bind(*r);
+            }
+            let rows: Vec<Row> = q.fetch_all(self.db).await?;
+            for r in rows {
+                if let (Some(k), Some(id)) = (r.k, r.id) {
+                    map.insert(k, id as i64);
+                }
             }
         }
         Ok(map)
@@ -628,14 +688,20 @@ fn build_upsert_output(
     o: &TableOutput,
     local_tx_id: i64,
     local_basket_id: Option<i64>,
+    // A2-plus: the LOCAL spending transaction_id, resolved by the caller from
+    // the incoming spent_by / spent_by_reference. Drives the FORWARD-ONLY
+    // spent_by clause (set on a locally-NULL spent_by, never clear).
+    local_spent_by: Option<i64>,
 ) -> Query {
     // Monotonic funds guard translated 1:1 from sync.rs:1499 + folded newer-wins.
-    // Proven in tests/f4_outputs_upsert_proof.py. locking_script via put_blob_column.
+    // A2-plus adds forward-only spent_by + demote-only-when-spend-proven.
+    // Proven in tests/f4_outputs_upsert_proof.py + f9 / spentness proofs.
+    // locking_script via put_blob_column.
     let purpose = o.purpose.clone().unwrap_or_else(|| "change".to_string());
     let provided_by = if o.provided_by.is_empty() { "you".to_string() } else { o.provided_by.clone() };
     let sql = "INSERT INTO outputs \
-         (user_id, transaction_id, basket_id, txid, vout, satoshis, locking_script, script_length, script_offset, type, provided_by, purpose, spendable, change, derivation_prefix, derivation_suffix, sender_identity_key, custom_instructions, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         (user_id, transaction_id, basket_id, txid, vout, satoshis, locking_script, script_length, script_offset, type, provided_by, purpose, spendable, change, derivation_prefix, derivation_suffix, sender_identity_key, custom_instructions, spent_by, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(transaction_id, vout, user_id) DO UPDATE SET \
            locking_script = CASE WHEN (outputs.locking_script IS NULL OR length(outputs.locking_script)=0) AND excluded.updated_at > outputs.updated_at THEN excluded.locking_script ELSE outputs.locking_script END, \
            transaction_id = CASE WHEN excluded.updated_at > outputs.updated_at THEN excluded.transaction_id ELSE outputs.transaction_id END, \
@@ -646,7 +712,8 @@ fn build_upsert_output(
            script_length = CASE WHEN (outputs.locking_script IS NULL OR length(outputs.locking_script)=0) AND excluded.updated_at > outputs.updated_at THEN excluded.script_length ELSE outputs.script_length END, \
            script_offset = CASE WHEN (outputs.locking_script IS NULL OR length(outputs.locking_script)=0) AND excluded.updated_at > outputs.updated_at THEN excluded.script_offset ELSE outputs.script_offset END, \
            type = CASE WHEN excluded.updated_at > outputs.updated_at THEN excluded.type ELSE outputs.type END, \
-           spendable = CASE WHEN outputs.spendable = 1 THEN 1 WHEN excluded.updated_at > outputs.updated_at THEN excluded.spendable ELSE outputs.spendable END, \
+           spent_by = CASE WHEN outputs.spent_by IS NULL THEN excluded.spent_by ELSE outputs.spent_by END, \
+           spendable = CASE WHEN outputs.spent_by IS NULL AND excluded.spent_by IS NOT NULL THEN 0 WHEN outputs.spendable = 1 THEN 1 WHEN excluded.updated_at > outputs.updated_at THEN excluded.spendable ELSE outputs.spendable END, \
            change = CASE WHEN outputs.change = 1 THEN 1 WHEN excluded.updated_at > outputs.updated_at THEN excluded.change ELSE outputs.change END, \
            derivation_prefix = CASE WHEN outputs.derivation_prefix IS NULL AND excluded.updated_at > outputs.updated_at THEN excluded.derivation_prefix ELSE outputs.derivation_prefix END, \
            derivation_suffix = CASE WHEN outputs.derivation_suffix IS NULL AND excluded.updated_at > outputs.updated_at THEN excluded.derivation_suffix ELSE outputs.derivation_suffix END, \
@@ -673,6 +740,7 @@ fn build_upsert_output(
         .bind(o.derivation_suffix.clone())
         .bind(o.sender_identity_key.clone())
         .bind(o.custom_instructions.clone())
+        .bind(local_spent_by)
         .bind(o.created_at)
         .bind(o.updated_at)
 }

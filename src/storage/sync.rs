@@ -258,6 +258,7 @@ struct OutputSyncRow {
     purpose: Option<String>,
     output_description: Option<String>,
     spent_by: Option<f64>,
+    spent_by_reference: Option<String>,
     sequence_number: Option<f64>,
     spending_description: Option<String>,
     spendable: Option<f64>,
@@ -967,17 +968,25 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         offset: u32,
         limit: u32,
     ) -> Result<Vec<TableOutput>> {
+        // A2-plus: alias outputs as `o` + LEFT JOIN transactions to carry the
+        // spending tx's stable `reference` (spent_by_reference) on each pulled
+        // output, so the client engine's FORWARD-ONLY apply can resolve the
+        // local spending tx and reflect spent state (the numeric spent_by FK is
+        // meaningless across stores).
         let mut sql = String::from(
-            "SELECT output_id, user_id, transaction_id, basket_id, txid, vout, satoshis, \
-             hex(locking_script) AS locking_script_hex, script_length, script_offset, type, provided_by, \
-             purpose, output_description, spent_by, sequence_number, spending_description, spendable, change, \
-             derivation_prefix, derivation_suffix, sender_identity_key, custom_instructions, created_at, updated_at \
-             FROM outputs WHERE user_id = ?",
+            "SELECT o.output_id, o.user_id, o.transaction_id, o.basket_id, o.txid, o.vout, o.satoshis, \
+             hex(o.locking_script) AS locking_script_hex, o.script_length, o.script_offset, o.type, o.provided_by, \
+             o.purpose, o.output_description, o.spent_by, o.sequence_number, o.spending_description, o.spendable, o.change, \
+             o.derivation_prefix, o.derivation_suffix, o.sender_identity_key, o.custom_instructions, o.created_at, o.updated_at, \
+             st.reference AS spent_by_reference \
+             FROM outputs o \
+             LEFT JOIN transactions st ON st.transaction_id = o.spent_by AND st.user_id = o.user_id \
+             WHERE o.user_id = ?",
         );
         if since.is_some() {
-            sql.push_str(" AND updated_at > ?");
+            sql.push_str(" AND o.updated_at > ?");
         }
-        sql.push_str(" ORDER BY updated_at ASC LIMIT ? OFFSET ?");
+        sql.push_str(" ORDER BY o.updated_at ASC LIMIT ? OFFSET ?");
         let mut q = Query::new(sql).bind(user_id);
         if let Some(s) = since {
             q = q.bind(s);
@@ -1004,6 +1013,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 purpose: r.purpose,
                 output_description: r.output_description,
                 spent_by: r.spent_by.map(|v| v as i64),
+                spent_by_reference: r.spent_by_reference,
                 sequence_number: r.sequence_number.map(|v| v as u32),
                 spending_description: r.spending_description,
                 spendable: r.spendable.map(|v| v != 0.0).unwrap_or(false),

@@ -242,6 +242,14 @@ pub struct TableOutput {
     pub purpose: Option<String>,
     pub output_description: Option<String>,
     pub spent_by: Option<i64>,
+    /// A2-plus sync-only: the `reference` (stable natural key) of the spending
+    /// transaction named by `spent_by`. Carried on the wire (key
+    /// `spentByReference`) so this STATELESS apply can resolve the local
+    /// spending tx by reference when its per-chunk `transaction_id_map` misses
+    /// — the numeric `spent_by` FK is meaningless across stores (mirrors
+    /// `basket_name`). Drives the FORWARD-ONLY spent_by sync.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spent_by_reference: Option<String>,
     pub sequence_number: Option<u32>,
     pub spending_description: Option<String>,
     #[serde(default)]
