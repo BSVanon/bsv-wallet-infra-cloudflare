@@ -626,10 +626,20 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             }
         }
         if let Some(outputs) = &chunk.outputs {
+            // F9: resolve a basket by NAME when the per-chunk id-map misses (see
+            // process_sync_chunk for the full rationale — the stateless apply
+            // otherwise stored outputs after the basket chunk basket-less).
+            let basket_name_map = self.load_basket_name_map(user_id).await?;
             for o in outputs {
                 let local_tx_id = transaction_id_map.get(&o.transaction_id).copied();
-                let local_basket_id =
-                    o.basket_id.and_then(|bid| basket_id_map.get(&bid).copied());
+                let local_basket_id = o
+                    .basket_id
+                    .and_then(|bid| basket_id_map.get(&bid).copied())
+                    .or_else(|| {
+                        o.basket_name
+                            .as_deref()
+                            .and_then(|n| basket_name_map.get(n).copied())
+                    });
                 let r = self
                     .upsert_output(user_id, o, local_tx_id, local_basket_id)
                     .await?;
@@ -982,6 +992,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 user_id: r.user_id.map(|v| v as i64).unwrap_or(user_id),
                 transaction_id: r.transaction_id.map(|v| v as i64).unwrap_or(0),
                 basket_id: r.basket_id.map(|v| v as i64),
+                basket_name: None,
                 txid: r.txid.unwrap_or_default(),
                 vout: r.vout.map(|v| v as i32).unwrap_or(0),
                 satoshis: r.satoshis.map(|v| v as i64).unwrap_or(0),

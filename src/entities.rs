@@ -217,6 +217,13 @@ pub struct TableOutput {
     #[serde(default)]
     pub transaction_id: i64,
     pub basket_id: Option<i64>,
+    /// F9 sync-only: NAME of this output's basket, carried so this STATELESS
+    /// chunk-by-chunk apply can resolve the local basket by name when the
+    /// per-chunk basket_id_map misses (baskets ride an early chunk, outputs
+    /// span later chunks → basket-less rows). Wire key `basketName`; None when
+    /// absent (e.g. an older producer, or CF-produced pull chunks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basket_name: Option<String>,
     #[serde(default)]
     pub txid: String,
     #[serde(default)]

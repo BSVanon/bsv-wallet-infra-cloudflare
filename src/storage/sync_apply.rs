@@ -215,6 +215,14 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             let txid_map = self
                 .load_id_map_by_txid("transactions", "transaction_id", Some(user_id), &out_txids)
                 .await?;
+            // F9: resolve a basket by NAME when this chunk's per-chunk id-map
+            // misses. The apply is STATELESS across chunk POSTs, so an output
+            // whose basket rode an EARLIER chunk has a foreign basket_id absent
+            // from THIS chunk's map → it was being stored basket-less, and a
+            // restored wallet under-counted its change. The basket row already
+            // exists in D1, so resolve it by the stable name the producer now
+            // carries on each output (basketName).
+            let basket_name_map = self.load_basket_name_map(user_id).await?;
             let mut included: Vec<&TableOutput> = Vec::new();
             let mut queries: Vec<Query> = Vec::new();
             for o in outputs {
@@ -223,7 +231,14 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                     .copied()
                     .or_else(|| txid_map.get(o.txid.as_str()).copied());
                 let Some(tx_id) = local_tx_id else { continue };
-                let local_basket_id = o.basket_id.and_then(|bid| basket_id_map.get(&bid).copied());
+                let local_basket_id = o
+                    .basket_id
+                    .and_then(|bid| basket_id_map.get(&bid).copied())
+                    .or_else(|| {
+                        o.basket_name
+                            .as_deref()
+                            .and_then(|n| basket_name_map.get(n).copied())
+                    });
                 queries.push(build_upsert_output(user_id, o, tx_id, local_basket_id));
                 included.push(o);
             }
@@ -377,6 +392,30 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 if let (Some(k), Some(id)) = (r.k, r.id) {
                     map.insert(k, id as i64);
                 }
+            }
+        }
+        Ok(map)
+    }
+
+    /// F9: load the user's output baskets as a name→local_id map. Used by the
+    /// stateless chunk-by-chunk apply to resolve an output's basket by name
+    /// when its foreign basket_id isn't in the current chunk's id-map.
+    pub(crate) async fn load_basket_name_map(&self, user_id: i64) -> Result<HashMap<String, i64>> {
+        #[derive(Deserialize)]
+        struct Row {
+            name: Option<String>,
+            id: Option<f64>,
+        }
+        let mut map: HashMap<String, i64> = HashMap::new();
+        let rows: Vec<Row> = Query::new(
+            "SELECT name, basket_id AS id FROM output_baskets WHERE user_id = ?".to_string(),
+        )
+        .bind(user_id)
+        .fetch_all(self.db)
+        .await?;
+        for r in rows {
+            if let (Some(name), Some(id)) = (r.name, r.id) {
+                map.insert(name, id as i64);
             }
         }
         Ok(map)

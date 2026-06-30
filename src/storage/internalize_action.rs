@@ -106,6 +106,7 @@ impl OutputRow {
             user_id: self.user_id.map(|v| v as i64).unwrap_or(0),
             transaction_id: self.transaction_id.map(|v| v as i64).unwrap_or(0),
             basket_id: self.basket_id.map(|v| v as i64),
+            basket_name: None,
             txid: self.txid.unwrap_or_default(),
             vout: self.vout.map(|v| v as i32).unwrap_or(0),
             satoshis: self.satoshis.map(|v| v as i64).unwrap_or(0),
