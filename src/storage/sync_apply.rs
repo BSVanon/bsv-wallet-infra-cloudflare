@@ -713,7 +713,7 @@ fn build_upsert_output(
            script_offset = CASE WHEN (outputs.locking_script IS NULL OR length(outputs.locking_script)=0) AND excluded.updated_at > outputs.updated_at THEN excluded.script_offset ELSE outputs.script_offset END, \
            type = CASE WHEN excluded.updated_at > outputs.updated_at THEN excluded.type ELSE outputs.type END, \
            spent_by = CASE WHEN outputs.spent_by IS NULL THEN excluded.spent_by ELSE outputs.spent_by END, \
-           spendable = CASE WHEN outputs.spent_by IS NULL AND excluded.spent_by IS NOT NULL THEN 0 WHEN outputs.spendable = 1 THEN 1 WHEN excluded.updated_at > outputs.updated_at THEN excluded.spendable ELSE outputs.spendable END, \
+           spendable = CASE WHEN outputs.spent_by IS NOT NULL THEN 0 WHEN excluded.spent_by IS NOT NULL THEN 0 WHEN outputs.spendable = 1 THEN 1 WHEN excluded.updated_at > outputs.updated_at THEN excluded.spendable ELSE outputs.spendable END, \
            change = CASE WHEN outputs.change = 1 THEN 1 WHEN excluded.updated_at > outputs.updated_at THEN excluded.change ELSE outputs.change END, \
            derivation_prefix = CASE WHEN outputs.derivation_prefix IS NULL AND excluded.updated_at > outputs.updated_at THEN excluded.derivation_prefix ELSE outputs.derivation_prefix END, \
            derivation_suffix = CASE WHEN outputs.derivation_suffix IS NULL AND excluded.updated_at > outputs.updated_at THEN excluded.derivation_suffix ELSE outputs.derivation_suffix END, \
