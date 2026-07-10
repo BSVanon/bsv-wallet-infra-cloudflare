@@ -82,11 +82,14 @@ impl BasketRow {
             basket_id: self.basket_id.map(|v| v as i64).unwrap_or(0),
             user_id: self.user_id.map(|v| v as i64).unwrap_or(0),
             name: self.name.unwrap_or_default(),
-            number_of_desired_utxos: self.number_of_desired_utxos.map(|v| v as i32).unwrap_or(6),
+            // Defensive fallback for anomalous NULL pool columns (inserts always
+            // set them). Aligned to the 16/32 'default' change-dust pool so a
+            // malformed row never reintroduces the stale 6/10000.
+            number_of_desired_utxos: self.number_of_desired_utxos.map(|v| v as i32).unwrap_or(16),
             minimum_desired_utxo_value: self
                 .minimum_desired_utxo_value
                 .map(|v| v as i64)
-                .unwrap_or(10000),
+                .unwrap_or(32),
             created_at: parse_datetime(&self.created_at),
             updated_at: parse_datetime(&self.updated_at),
         }
@@ -144,6 +147,16 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         storage_name: &str,
         storage_identity_key: &str,
     ) -> Result<String> {
+        // #1 change-dust (2026-07-08, Codex 9dae0cc4) — one-shot idempotent retune
+        // of any dormant legacy `default` change basket in D1 to 16/32. Historical
+        // rows written by pre-fix clients (engine legacy 144/32) or authored
+        // server-side (pre-W-14 6/10000) would otherwise survive into a
+        // restore/sync and reintroduce the old, larger change pool. Runs on every
+        // migrate (client storage-init) so it reaches existing users; the WHERE
+        // matches only legacy rows so it self-empties. Correcting the row at the
+        // SOURCE means a restore pulls the already-16/32 row (no one-session lag).
+        self.retune_legacy_default_baskets().await?;
+
         // Check if settings exist
         let existing: Option<SettingsRow> =
             Query::new("SELECT * FROM settings WHERE settings_id = 1")
@@ -229,6 +242,24 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         ))
     }
 
+    /// #1 change-dust (2026-07-08) — one-shot idempotent retune of every legacy
+    /// `default` change basket in D1 to 16/32. Catches BOTH the engine legacy
+    /// 144/32 (synced up by pre-fix clients) and the worker's own pre-W-14
+    /// 6/10000. Scoped to `name = 'default'` so custom baskets are untouched; the
+    /// WHERE matches only legacy rows so repeat runs are no-ops. Bumps `updated_at`
+    /// so the corrected value wins the compare-`updated_at` sync merge back to any
+    /// client that later pulls it.
+    async fn retune_legacy_default_baskets(&self) -> Result<()> {
+        let now = Utc::now();
+        Query::new(
+            "UPDATE output_baskets SET number_of_desired_utxos = 16, minimum_desired_utxo_value = 32, updated_at = ? WHERE name = 'default' AND number_of_desired_utxos IN (144, 6)",
+        )
+        .bind(now)
+        .execute(self.db)
+        .await?;
+        Ok(())
+    }
+
     /// Find or create the "default" output basket for a user.
     pub async fn find_or_create_default_basket(&self, user_id: i64) -> Result<TableOutputBasket> {
         let existing: Option<BasketRow> = Query::new(
@@ -242,10 +273,17 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             return Ok(row.into_table());
         }
 
-        // Create default basket
+        // Create default basket.
+        // #1 change-dust (2026-07-08): the 'default' change basket is 16/32,
+        // matching the engine (bsv-wallet-toolbox-rs). The prior 6/10000 was the
+        // stale PRE-W-14 config — the engine moved off it to 144/32 (canonical)
+        // then to 16/32 (change-dust divergence: each random-derivation change
+        // output is a funds-loss liability until L2-backed-up, so a small pool =
+        // fewer liabilities). Reconciled here so a server-authored 'default' can
+        // never sync a 6/10000 pool back down and defeat change-dust.
         let now = Utc::now();
         let meta = Query::new(
-            "INSERT INTO output_baskets (user_id, name, number_of_desired_utxos, minimum_desired_utxo_value, created_at, updated_at) VALUES (?, 'default', 6, 10000, ?, ?)",
+            "INSERT INTO output_baskets (user_id, name, number_of_desired_utxos, minimum_desired_utxo_value, created_at, updated_at) VALUES (?, 'default', 16, 32, ?, ?)",
         )
         .bind(user_id)
         .bind(now)
@@ -257,8 +295,8 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             basket_id: meta.last_row_id,
             user_id,
             name: "default".to_string(),
-            number_of_desired_utxos: 6,
-            minimum_desired_utxo_value: 10000,
+            number_of_desired_utxos: 16,
+            minimum_desired_utxo_value: 32,
             created_at: now,
             updated_at: now,
         })
@@ -278,12 +316,21 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             return Ok(row.basket_id.map(|v| v as i64).unwrap_or(0));
         }
 
+        // Mirror the engine's basket-pool policy (bsv-wallet-toolbox-rs): the
+        // 'default' change basket = 16/32 (#1 change-dust), every CUSTOM basket =
+        // 0/0 (pool-inert — no change maintenance). Previously hardcoded 6/10000
+        // for all baskets, which was both the stale pre-W-14 default AND wrong
+        // for custom baskets (they must not pool change).
         let now = Utc::now();
+        let (num_desired, min_value): (i64, i64) =
+            if name == "default" { (16, 32) } else { (0, 0) };
         let meta = Query::new(
-            "INSERT INTO output_baskets (user_id, name, number_of_desired_utxos, minimum_desired_utxo_value, created_at, updated_at) VALUES (?, ?, 6, 10000, ?, ?)",
+            "INSERT INTO output_baskets (user_id, name, number_of_desired_utxos, minimum_desired_utxo_value, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(user_id)
         .bind(name)
+        .bind(num_desired)
+        .bind(min_value)
         .bind(now)
         .bind(now)
         .execute(self.db)
@@ -676,8 +723,8 @@ mod tests {
         assert_eq!(table.basket_id, 0);
         assert_eq!(table.user_id, 0);
         assert_eq!(table.name, "");
-        assert_eq!(table.number_of_desired_utxos, 6); // default
-        assert_eq!(table.minimum_desired_utxo_value, 10000); // default
+        assert_eq!(table.number_of_desired_utxos, 16); // default (16/32, #1 change-dust)
+        assert_eq!(table.minimum_desired_utxo_value, 32); // default (16/32, #1 change-dust)
     }
 
     #[test]
@@ -755,10 +802,11 @@ mod tests {
 
     #[test]
     fn default_basket_values() {
-        // Default basket: 6 desired UTXOs, 10000 sat minimum
-        let desired_utxos = 6;
-        let min_value = 10000i64;
-        assert_eq!(desired_utxos, 6);
-        assert_eq!(min_value, 10000);
+        // Default basket: 16 desired UTXOs, 32 sat minimum (#1 change-dust,
+        // reconciled to the engine — was the stale pre-W-14 6/10000).
+        let desired_utxos = 16;
+        let min_value = 32i64;
+        assert_eq!(desired_utxos, 16);
+        assert_eq!(min_value, 32);
     }
 }

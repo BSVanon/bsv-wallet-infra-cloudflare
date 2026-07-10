@@ -804,15 +804,15 @@ mod tests {
             "basketId": 1,
             "userId": 1,
             "name": "default",
-            "numberOfDesiredUtxos": 6,
-            "minimumDesiredUtxoValue": 10000,
+            "numberOfDesiredUtxos": 16,
+            "minimumDesiredUtxoValue": 32,
             "createdAt": "2024-01-01T00:00:00Z",
             "updatedAt": "2024-01-01T00:00:00Z"
         });
         let basket: TableOutputBasket = serde_json::from_value(val).unwrap();
         assert_eq!(basket.name, "default");
-        assert_eq!(basket.number_of_desired_utxos, 6);
-        assert_eq!(basket.minimum_desired_utxo_value, 10000);
+        assert_eq!(basket.number_of_desired_utxos, 16);
+        assert_eq!(basket.minimum_desired_utxo_value, 32);
     }
 
     // =========================================================================

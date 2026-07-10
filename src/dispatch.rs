@@ -101,6 +101,11 @@ pub async fn dispatch<B: crate::services::BroadcastService + crate::services::Pr
         "getSyncChunk" => handle_get_sync_chunk(storage, params, id.clone(), auth).await,
         "processSyncChunk" => handle_process_sync_chunk(storage, params, id.clone(), auth).await,
 
+        // BRC-38 durable backup (release blocker #1): channel-independent
+        // encrypted BRC-38 blob store/fetch in R2, keyed by authenticated identity.
+        "putBackup" => handle_put_backup(storage, params, id.clone(), auth).await,
+        "getBackup" => handle_get_backup(storage, params, id.clone(), auth).await,
+
         // Phase 4: Monitor
         "reviewStatus" => handle_review_status(storage, id.clone(), auth).await,
 
@@ -534,6 +539,108 @@ async fn handle_process_sync_chunk<
     let result = storage.process_sync_chunk(user_id, args, chunk).await?;
     let result_val = serde_json::to_value(&result)?;
     Ok(serde_json::to_value(JsonRpcResponse::success(id, result_val)).unwrap())
+}
+
+// =============================================================================
+// BRC-38 durable backup (release blocker #1 — the channel-INDEPENDENT recovery
+// path). The blob is CIPHERTEXT: encrypted client-side via BRC-2 before it ever
+// reaches here, so the worker stores an opaque object it cannot read. The R2
+// object key is derived from the AUTHENTICATED identity (never a client param),
+// so a caller can only read/write their OWN backup.
+//
+// Single object per user (`backup/{identityKey}`), overwrite-latest — this
+// closes the primary single-device-wipe hole (the friend's exact case).
+// MULTI-DEVICE (gate Q4, follow-up): two concurrent devices with divergent state
+// can clobber each other's latest blob here; the per-device-key +
+// list-merge-on-restore refinement needs an R2 `list` and is tracked separately.
+// =============================================================================
+
+fn backup_object_key(identity_key: &str) -> String {
+    format!("backup/{}", identity_key)
+}
+
+async fn handle_put_backup<
+    B: crate::services::BroadcastService + crate::services::ProofService,
+>(
+    storage: &StorageD1<'_, B>,
+    params: Value,
+    id: Value,
+    auth: Option<&AuthId>,
+) -> Result<Value, Error> {
+    use base64::Engine as _;
+    let auth = auth
+        .ok_or_else(|| Error::ValidationError("putBackup requires authentication".to_string()))?;
+    let (_user_id, auth) = storage.resolve_auth(auth).await?;
+
+    // Accept { blob: "<base64>" } or ["<base64>"].
+    let blob_b64 = match &params {
+        Value::Array(arr) => arr.first().and_then(|v| v.as_str()),
+        Value::Object(_) => params.get("blob").and_then(|v| v.as_str()),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        Error::ValidationError("putBackup: missing 'blob' (base64 string)".to_string())
+    })?;
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(blob_b64.as_bytes())
+        .map_err(|e| Error::ValidationError(format!("putBackup: bad base64 blob: {}", e)))?;
+
+    let key = backup_object_key(&auth.identity_key);
+    storage
+        .blobs()
+        .put(&key, bytes.clone())
+        .execute()
+        .await
+        .map_err(|e| Error::InternalError(format!("putBackup: R2 put failed: {}", e)))?;
+
+    Ok(serde_json::to_value(JsonRpcResponse::success(
+        id,
+        serde_json::json!({ "ok": true, "bytes": bytes.len() }),
+    ))
+    .unwrap())
+}
+
+async fn handle_get_backup<
+    B: crate::services::BroadcastService + crate::services::ProofService,
+>(
+    storage: &StorageD1<'_, B>,
+    _params: Value,
+    id: Value,
+    auth: Option<&AuthId>,
+) -> Result<Value, Error> {
+    use base64::Engine as _;
+    let auth = auth
+        .ok_or_else(|| Error::ValidationError("getBackup requires authentication".to_string()))?;
+    let (_user_id, auth) = storage.resolve_auth(auth).await?;
+
+    let key = backup_object_key(&auth.identity_key);
+    let obj = storage
+        .blobs()
+        .get(&key)
+        .execute()
+        .await
+        .map_err(|e| Error::InternalError(format!("getBackup: R2 get failed: {}", e)))?;
+
+    let blob_b64 = match obj {
+        Some(obj) => {
+            let body = obj.body().ok_or_else(|| {
+                Error::InternalError("getBackup: R2 object has no body".to_string())
+            })?;
+            let bytes = body
+                .bytes()
+                .await
+                .map_err(|e| Error::InternalError(format!("getBackup: R2 read failed: {}", e)))?;
+            Some(base64::engine::general_purpose::STANDARD.encode(&bytes))
+        }
+        None => None,
+    };
+
+    Ok(serde_json::to_value(JsonRpcResponse::success(
+        id,
+        serde_json::json!({ "blob": blob_b64 }),
+    ))
+    .unwrap())
 }
 
 // =============================================================================

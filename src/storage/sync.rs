@@ -731,8 +731,10 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 basket_id: r.basket_id.map(|v| v as i64).unwrap_or(0),
                 user_id: r.user_id.map(|v| v as i64).unwrap_or(user_id),
                 name: r.name.unwrap_or_default(),
-                number_of_desired_utxos: r.number_of_desired_utxos.map(|v| v as i32).unwrap_or(6),
-                minimum_desired_utxo_value: r.minimum_desired_utxo_value.map(|v| v as i64).unwrap_or(10000),
+                // Defensive NULL fallback aligned to the 16/32 'default' change-dust
+                // pool (was the stale pre-W-14 6/10000). Inserts always set these.
+                number_of_desired_utxos: r.number_of_desired_utxos.map(|v| v as i32).unwrap_or(16),
+                minimum_desired_utxo_value: r.minimum_desired_utxo_value.map(|v| v as i64).unwrap_or(32),
                 created_at: parse_datetime_pub(&r.created_at),
                 updated_at: parse_datetime_pub(&r.updated_at),
             })
