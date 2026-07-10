@@ -264,6 +264,15 @@ pub struct TableOutput {
     pub created_at: DateTime<Utc>,
     #[serde(default = "default_datetime")]
     pub updated_at: DateTime<Utc>,
+    /// G3 sync-only: a client-computed signal (wire key `syncDemote`) that a
+    /// `spendable = 0` pushed row is a LEGITIMATE chain/failed demote (a
+    /// failed-tx own-output with no live spend ref), so this funds-monotonic
+    /// consumer may apply exactly that demote instead of rejecting it — which
+    /// is what otherwise leaves a spent/failed change output as a cloud phantom
+    /// that a restore re-adds. `None` (absent on the wire) for an older client
+    /// or any non-demote row → the guard behaves exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_demote: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

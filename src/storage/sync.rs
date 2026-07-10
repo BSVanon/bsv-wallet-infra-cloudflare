@@ -1026,6 +1026,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 custom_instructions: r.custom_instructions,
                 created_at: parse_datetime_pub(&r.created_at),
                 updated_at: parse_datetime_pub(&r.updated_at),
+                sync_demote: None,
             });
         }
         Ok(out)

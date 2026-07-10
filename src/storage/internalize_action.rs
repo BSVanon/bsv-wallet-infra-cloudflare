@@ -129,6 +129,7 @@ impl OutputRow {
             custom_instructions: self.custom_instructions,
             created_at: super::writers::parse_datetime_pub(&self.created_at),
             updated_at: super::writers::parse_datetime_pub(&self.updated_at),
+            sync_demote: None,
         }
     }
 }

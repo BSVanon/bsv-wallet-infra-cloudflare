@@ -713,7 +713,7 @@ fn build_upsert_output(
            script_offset = CASE WHEN (outputs.locking_script IS NULL OR length(outputs.locking_script)=0) AND excluded.updated_at > outputs.updated_at THEN excluded.script_offset ELSE outputs.script_offset END, \
            type = CASE WHEN excluded.updated_at > outputs.updated_at THEN excluded.type ELSE outputs.type END, \
            spent_by = CASE WHEN outputs.spent_by IS NULL THEN excluded.spent_by ELSE outputs.spent_by END, \
-           spendable = CASE WHEN outputs.spent_by IS NOT NULL THEN 0 WHEN excluded.spent_by IS NOT NULL THEN 0 WHEN outputs.spendable = 1 THEN 1 WHEN excluded.updated_at > outputs.updated_at THEN excluded.spendable ELSE outputs.spendable END, \
+           spendable = CASE WHEN outputs.spent_by IS NOT NULL THEN 0 WHEN excluded.spent_by IS NOT NULL THEN 0 WHEN ? = 1 AND outputs.spent_by IS NULL AND excluded.updated_at > outputs.updated_at THEN 0 WHEN outputs.spendable = 1 THEN 1 WHEN excluded.updated_at > outputs.updated_at THEN excluded.spendable ELSE outputs.spendable END, \
            change = CASE WHEN outputs.change = 1 THEN 1 WHEN excluded.updated_at > outputs.updated_at THEN excluded.change ELSE outputs.change END, \
            derivation_prefix = CASE WHEN outputs.derivation_prefix IS NULL AND excluded.updated_at > outputs.updated_at THEN excluded.derivation_prefix ELSE outputs.derivation_prefix END, \
            derivation_suffix = CASE WHEN outputs.derivation_suffix IS NULL AND excluded.updated_at > outputs.updated_at THEN excluded.derivation_suffix ELSE outputs.derivation_suffix END, \
@@ -743,6 +743,12 @@ fn build_upsert_output(
         .bind(local_spent_by)
         .bind(o.created_at)
         .bind(o.updated_at)
+        // G3 (Codex 72341329): the demote flag for the spendable CASE's
+        // sync_demote arm — a positional `?` appearing in the ON CONFLICT
+        // clause (after all 21 INSERT binds). Gated on `sync_demote AND NOT
+        // incoming.spendable` so a malformed row that claims BOTH a demote
+        // signal AND spendable=true can never demote a good local output.
+        .bind(if o.sync_demote == Some(true) && !o.spendable { 1i64 } else { 0 })
 }
 
 fn build_upsert_tx_label_map(
