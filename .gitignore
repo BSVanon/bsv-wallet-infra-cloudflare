@@ -31,3 +31,4 @@ D1-QUERIES.md
 # Local ad-hoc maintenance scripts (one-off ops tooling — not for distribution)
 repair_*.mjs
 verify_monitor.sh
+.cargo-targets/

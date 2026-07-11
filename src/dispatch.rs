@@ -103,8 +103,13 @@ pub async fn dispatch<B: crate::services::BroadcastService + crate::services::Pr
 
         // BRC-38 durable backup (release blocker #1): channel-independent
         // encrypted BRC-38 blob store/fetch in R2, keyed by authenticated identity.
+        // MULTI-DEVICE (Codex 5b4fe9d6): putBackup writes the caller's per-device
+        // object (`backup/{identity}/{deviceId}`); listBackups returns EVERY blob
+        // (all per-device objects + the legacy single object) so restore unions
+        // every device's change. getBackup stays for single-object back-compat.
         "putBackup" => handle_put_backup(storage, params, id.clone(), auth).await,
         "getBackup" => handle_get_backup(storage, params, id.clone(), auth).await,
+        "listBackups" => handle_list_backups(storage, params, id.clone(), auth).await,
 
         // Phase 4: Monitor
         "reviewStatus" => handle_review_status(storage, id.clone(), auth).await,
@@ -548,15 +553,49 @@ async fn handle_process_sync_chunk<
 // object key is derived from the AUTHENTICATED identity (never a client param),
 // so a caller can only read/write their OWN backup.
 //
-// Single object per user (`backup/{identityKey}`), overwrite-latest — this
-// closes the primary single-device-wipe hole (the friend's exact case).
-// MULTI-DEVICE (gate Q4, follow-up): two concurrent devices with divergent state
-// can clobber each other's latest blob here; the per-device-key +
-// list-merge-on-restore refinement needs an R2 `list` and is tracked separately.
+// MULTI-DEVICE (Codex 5b4fe9d6): each device writes its OWN object at
+// `backup/{identityKey}/{deviceId}`, so a second device can NEVER clobber
+// another's blob (the total-silent-loss vector). Restore LISTs the prefix +
+// unions every blob. The LEGACY single object (`backup/{identityKey}`,
+// no device segment) is still WRITTEN by old clients and still READ on restore
+// (dual-read, never migrated/deleted) so nobody already deployed loses a backup.
 // =============================================================================
 
+/// Legacy single-object key (pre-multi-device). Still read on restore.
 fn backup_object_key(identity_key: &str) -> String {
     format!("backup/{}", identity_key)
+}
+
+/// Per-device object key. The deviceId partitions within the identity's own
+/// namespace (NOT a security boundary — the BRC-103 identity auth is).
+fn backup_device_object_key(identity_key: &str, device_id: &str) -> String {
+    format!("backup/{}/{}", identity_key, device_id)
+}
+
+/// The R2 LIST prefix that matches every PER-DEVICE object for an identity (the
+/// trailing slash excludes the legacy `backup/{identityKey}` object, which is
+/// read separately on restore).
+fn backup_device_prefix(identity_key: &str) -> String {
+    format!("backup/{}/", identity_key)
+}
+
+/// Validate a client-supplied deviceId server-side (Codex 5b4fe9d6): a bounded
+/// URL/key-safe token. NEVER trust a blob-mirrored id as authority; this is the
+/// only accepted source, and it only ever partitions the caller's OWN identity
+/// namespace. Rejects anything that could escape the prefix (slashes, dots) or
+/// bloat the key.
+fn validate_device_id(device_id: &str) -> Result<(), Error> {
+    let ok = (8..=64).contains(&device_id.len())
+        && device_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::ValidationError(
+            "putBackup: invalid deviceId (want 8-64 chars of [A-Za-z0-9_-])".to_string(),
+        ))
+    }
 }
 
 async fn handle_put_backup<
@@ -586,7 +625,23 @@ async fn handle_put_backup<
         .decode(blob_b64.as_bytes())
         .map_err(|e| Error::ValidationError(format!("putBackup: bad base64 blob: {}", e)))?;
 
-    let key = backup_object_key(&auth.identity_key);
+    // MULTI-DEVICE: a client that supplies a valid `deviceId` writes its OWN
+    // per-device object (can't clobber another device). A legacy client with no
+    // deviceId keeps writing the single object (back-compat). Both call shapes
+    // carry it: the engine's array-based RPC sends `[blob, deviceId]`, and the
+    // object form `{ blob, deviceId }` is accepted for direct/manual callers.
+    let device_id = match &params {
+        Value::Object(_) => params.get("deviceId").and_then(|v| v.as_str()),
+        Value::Array(arr) => arr.get(1).and_then(|v| v.as_str()),
+        _ => None,
+    };
+    let key = match device_id {
+        Some(d) => {
+            validate_device_id(d)?;
+            backup_device_object_key(&auth.identity_key, d)
+        }
+        None => backup_object_key(&auth.identity_key),
+    };
     storage
         .blobs()
         .put(&key, bytes.clone())
@@ -639,6 +694,79 @@ async fn handle_get_backup<
     Ok(serde_json::to_value(JsonRpcResponse::success(
         id,
         serde_json::json!({ "blob": blob_b64 }),
+    ))
+    .unwrap())
+}
+
+// MULTI-DEVICE restore (Codex 5b4fe9d6): return EVERY backup blob for the
+// authenticated identity — all per-device objects (LIST prefix) PLUS the legacy
+// single object (dual-read, never migrated). The client decrypts + imports each
+// through the funds-monotonic merge (sequential import = union of every device's
+// change). Per-blob decrypt/import failures are the client's to isolate (a
+// corrupt orphan must not abort the whole restore).
+async fn handle_list_backups<
+    B: crate::services::BroadcastService + crate::services::ProofService,
+>(
+    storage: &StorageD1<'_, B>,
+    _params: Value,
+    id: Value,
+    auth: Option<&AuthId>,
+) -> Result<Value, Error> {
+    use base64::Engine as _;
+    let auth = auth
+        .ok_or_else(|| Error::ValidationError("listBackups requires authentication".to_string()))?;
+    let (_user_id, auth) = storage.resolve_auth(auth).await?;
+
+    let read_blob = |bytes: Vec<u8>| base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let mut blobs: Vec<String> = Vec::new();
+
+    // 1) Per-device objects under `backup/{identity}/`.
+    let prefix = backup_device_prefix(&auth.identity_key);
+    let listed = storage
+        .blobs()
+        .list()
+        .prefix(prefix)
+        .execute()
+        .await
+        .map_err(|e| Error::InternalError(format!("listBackups: R2 list failed: {}", e)))?;
+    for obj in listed.objects() {
+        let key = obj.key();
+        let got = storage
+            .blobs()
+            .get(&key)
+            .execute()
+            .await
+            .map_err(|e| Error::InternalError(format!("listBackups: R2 get failed: {}", e)))?;
+        if let Some(o) = got {
+            if let Some(body) = o.body() {
+                let bytes = body.bytes().await.map_err(|e| {
+                    Error::InternalError(format!("listBackups: R2 read failed: {}", e))
+                })?;
+                blobs.push(read_blob(bytes));
+            }
+        }
+    }
+
+    // 2) Legacy single object `backup/{identity}` (dual-read; never migrated).
+    let legacy_key = backup_object_key(&auth.identity_key);
+    let legacy = storage
+        .blobs()
+        .get(&legacy_key)
+        .execute()
+        .await
+        .map_err(|e| Error::InternalError(format!("listBackups: legacy R2 get failed: {}", e)))?;
+    if let Some(o) = legacy {
+        if let Some(body) = o.body() {
+            let bytes = body.bytes().await.map_err(|e| {
+                Error::InternalError(format!("listBackups: legacy R2 read failed: {}", e))
+            })?;
+            blobs.push(read_blob(bytes));
+        }
+    }
+
+    Ok(serde_json::to_value(JsonRpcResponse::success(
+        id,
+        serde_json::json!({ "blobs": blobs }),
     ))
     .unwrap())
 }
