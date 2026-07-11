@@ -721,29 +721,50 @@ async fn handle_list_backups<
     let mut blobs: Vec<String> = Vec::new();
 
     // 1) Per-device objects under `backup/{identity}/`.
+    //
+    // PAGINATION (bughunt Finding #5): R2 LIST returns at most 1000 keys per
+    // call. Device objects are immortal (never migrated/deleted) and a fresh
+    // deviceId is minted on every full storage wipe, so an identity can exceed
+    // 1000 objects over time. Without following the cursor, everything past the
+    // first 1000 (by lexicographic key) is silently dropped from the restore
+    // union — a blob holding unique un-synced change could be omitted. Loop on
+    // `truncated()`/`cursor()` so EVERY device object is returned.
     let prefix = backup_device_prefix(&auth.identity_key);
-    let listed = storage
-        .blobs()
-        .list()
-        .prefix(prefix)
-        .execute()
-        .await
-        .map_err(|e| Error::InternalError(format!("listBackups: R2 list failed: {}", e)))?;
-    for obj in listed.objects() {
-        let key = obj.key();
-        let got = storage
-            .blobs()
-            .get(&key)
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut builder = storage.blobs().list().prefix(prefix.clone());
+        if let Some(c) = cursor.take() {
+            builder = builder.cursor(c);
+        }
+        let listed = builder
             .execute()
             .await
-            .map_err(|e| Error::InternalError(format!("listBackups: R2 get failed: {}", e)))?;
-        if let Some(o) = got {
-            if let Some(body) = o.body() {
-                let bytes = body.bytes().await.map_err(|e| {
-                    Error::InternalError(format!("listBackups: R2 read failed: {}", e))
-                })?;
-                blobs.push(read_blob(bytes));
+            .map_err(|e| Error::InternalError(format!("listBackups: R2 list failed: {}", e)))?;
+        for obj in listed.objects() {
+            let key = obj.key();
+            let got = storage
+                .blobs()
+                .get(&key)
+                .execute()
+                .await
+                .map_err(|e| Error::InternalError(format!("listBackups: R2 get failed: {}", e)))?;
+            if let Some(o) = got {
+                if let Some(body) = o.body() {
+                    let bytes = body.bytes().await.map_err(|e| {
+                        Error::InternalError(format!("listBackups: R2 read failed: {}", e))
+                    })?;
+                    blobs.push(read_blob(bytes));
+                }
             }
+        }
+        if listed.truncated() {
+            cursor = listed.cursor();
+            // Defensive: truncated but no cursor → stop rather than loop forever.
+            if cursor.is_none() {
+                break;
+            }
+        } else {
+            break;
         }
     }
 

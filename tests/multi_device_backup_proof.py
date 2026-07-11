@@ -68,8 +68,16 @@ class R2:
     def get(self, key):
         return self.objects.get(key)
 
-    def list(self, prefix):
-        return {k: v for k, v in self.objects.items() if k.startswith(prefix)}
+    # R2 LIST returns at most `limit` (max 1000) keys per call, sorted by key,
+    # with a cursor to page the rest — modeled here so the pagination fix is
+    # provable offline.
+    def list(self, prefix, cursor=None, limit=1000):
+        keys = sorted(k for k in self.objects if k.startswith(prefix))
+        start = keys.index(cursor) + 1 if cursor in keys else 0
+        page = keys[start : start + limit]
+        truncated = (start + limit) < len(keys)
+        next_cursor = page[-1] if (truncated and page) else None
+        return page, truncated, next_cursor
 
 
 # ---- mirror of the two handlers --------------------------------------------
@@ -88,10 +96,18 @@ def handle_put_backup(r2, identity, blob, device_id=None):
 
 def handle_list_backups(r2, identity):
     blobs = []
-    # 1) per-device objects under `backup/{id}/`
-    listed = r2.list(backup_device_prefix(identity))
-    for key in sorted(listed):
-        blobs.append(listed[key])
+    # 1) per-device objects under `backup/{id}/` — PAGINATE the cursor so every
+    #    object is returned even past the 1000-per-call cap (Finding #5).
+    prefix = backup_device_prefix(identity)
+    cursor = None
+    while True:
+        page, truncated, next_cursor = r2.list(prefix, cursor)
+        for key in page:
+            blobs.append(r2.get(key))
+        if truncated and next_cursor is not None:
+            cursor = next_cursor
+        else:
+            break
     # 2) legacy single object `backup/{id}` (dual-read; never migrated)
     legacy = r2.get(backup_object_key(identity))
     if legacy is not None:
@@ -157,6 +173,20 @@ def main():
     handle_put_backup(r2b, ID, "blobA2", DEV_A)  # A re-writes
     ok &= check("A's re-write overwrote only A", r2b.get(key_a) == "blobA2")
     ok &= check("B untouched by A's re-write", r2b.get(key_b) == "blobB1")
+
+    # PAGINATION (Finding #5): >1000 immortal device objects must ALL be
+    # returned, not just the first 1000 R2 page. Seed 1500 with distinct blobs;
+    # the object holding unique change sorts past position 1000.
+    r2p = R2()
+    for i in range(1500):
+        dev = "device-%08d" % i  # >=8 chars, valid
+        r2p.put(backup_device_object_key(ID, dev), "blob-%04d" % i)
+    listed = handle_list_backups(r2p, ID)
+    ok &= check("all 1500 device objects returned (cursor paged)", len(listed) == 1500)
+    ok &= check(
+        "the object past position 1000 is included",
+        "blob-1400" in listed,
+    )
 
     print("\n" + ("ALL PASS" if ok else "FAILURES"))
     sys.exit(0 if ok else 1)
