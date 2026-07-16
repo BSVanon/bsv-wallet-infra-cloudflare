@@ -110,6 +110,10 @@ pub async fn dispatch<B: crate::services::BroadcastService + crate::services::Pr
         "putBackup" => handle_put_backup(storage, params, id.clone(), auth).await,
         "getBackup" => handle_get_backup(storage, params, id.clone(), auth).await,
         "listBackups" => handle_list_backups(storage, params, id.clone(), auth).await,
+        // Q4 (Codex `ed6581ae`): metadata-only proof that a backup EXISTS.
+        // Deliberately a SEPARATE RPC rather than a flag on listBackups — that
+        // path is funds-restore and must not be touched for a UI feature.
+        "statBackups" => handle_stat_backups(storage, params, id.clone(), auth).await,
 
         // Phase 4: Monitor
         "reviewStatus" => handle_review_status(storage, id.clone(), auth).await,
@@ -788,6 +792,111 @@ async fn handle_list_backups<
     Ok(serde_json::to_value(JsonRpcResponse::success(
         id,
         serde_json::json!({ "blobs": blobs }),
+    ))
+    .unwrap())
+}
+
+/// Q4 · `statBackups` — METADATA-ONLY proof that a backup object exists.
+///
+/// Answers "is my encrypted backup actually in R2?" WITHOUT downloading a single
+/// blob body. `listBackups` (the restore path) walks the same objects but reads
+/// every body — using it to answer an existence question would download every
+/// backup an identity owns to render a UI pill.
+///
+/// Canonical note: `wallet-toolbox` has NO remote-durability-proof idiom (its
+/// `isAvailable`/`makeAvailable` is LIVENESS — "can I reach the store" — not
+/// durability, and `TableSyncState` is a LOCAL record of what we believe we
+/// pushed). This is a deliberate necessary-novel addition: canonical assumes a
+/// trusted server-side store, whereas our funds recovery depends on an R2 blob
+/// the user may be encouraged to wipe local state against.
+///
+/// ⚠️ THE LEGACY TRAP (Codex `ed6581ae`): the pre-multi-device object
+/// `backup/{identity}` has NO device segment, so it can belong to ANY device.
+/// It is reported (so the caller can reason about it) but is flagged
+/// `deviceScoped: false` and carries NO deviceId — the client MUST NOT let it
+/// satisfy a current-device "verified" claim. Change is randomly derived
+/// per-device: another device's blob is NOT proof that THIS device's change is
+/// recoverable, and saying so would be exactly the false comfort I-3 bans.
+///
+/// Shares the restore path's pagination contract (bughunt Finding #5): R2 LIST
+/// caps at 1000 keys and device objects are immortal, so the cursor MUST be
+/// followed or the proof would silently disagree with what restore can see.
+async fn handle_stat_backups<
+    B: crate::services::BroadcastService + crate::services::ProofService,
+>(
+    storage: &StorageD1<'_, B>,
+    _params: Value,
+    id: Value,
+    auth: Option<&AuthId>,
+) -> Result<Value, Error> {
+    let auth = auth
+        .ok_or_else(|| Error::ValidationError("statBackups requires authentication".to_string()))?;
+    let (_user_id, auth) = storage.resolve_auth(auth).await?;
+
+    let mut objects: Vec<Value> = Vec::new();
+
+    // 1) Per-device objects under `backup/{identity}/` — the ONLY ones that may
+    //    prove a specific device. Same cursor-following walk as the restore path.
+    let prefix = backup_device_prefix(&auth.identity_key);
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut builder = storage.blobs().list().prefix(prefix.clone());
+        if let Some(c) = cursor.take() {
+            builder = builder.cursor(c);
+        }
+        let listed = builder
+            .execute()
+            .await
+            .map_err(|e| Error::InternalError(format!("statBackups: R2 list failed: {}", e)))?;
+        for obj in listed.objects() {
+            let key = obj.key();
+            // `backup/{identity}/{deviceId}` → take the trailing segment. A key
+            // without one cannot prove a device; skip rather than guess.
+            let device_id = match key.rsplit('/').next() {
+                Some(d) if !d.is_empty() => d.to_string(),
+                _ => continue,
+            };
+            objects.push(serde_json::json!({
+                "deviceId": device_id,
+                "deviceScoped": true,
+                "size": obj.size(),
+                "uploaded": obj.uploaded().as_millis(),
+                "etag": obj.etag(),
+            }));
+        }
+        if listed.truncated() {
+            cursor = listed.cursor();
+            // Defensive: truncated but no cursor → stop rather than loop forever.
+            if cursor.is_none() {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    // 2) Legacy single object `backup/{identity}` — reported, but NEVER
+    //    device-scoped (see THE LEGACY TRAP above). HEAD, not GET: we need
+    //    existence + metadata, not the payload.
+    let legacy_key = backup_object_key(&auth.identity_key);
+    let legacy = storage
+        .blobs()
+        .head(&legacy_key)
+        .await
+        .map_err(|e| Error::InternalError(format!("statBackups: legacy R2 head failed: {}", e)))?;
+    if let Some(o) = legacy {
+        objects.push(serde_json::json!({
+            "deviceId": Value::Null,
+            "deviceScoped": false,
+            "size": o.size(),
+            "uploaded": o.uploaded().as_millis(),
+            "etag": o.etag(),
+        }));
+    }
+
+    Ok(serde_json::to_value(JsonRpcResponse::success(
+        id,
+        serde_json::json!({ "objects": objects }),
     ))
     .unwrap())
 }
