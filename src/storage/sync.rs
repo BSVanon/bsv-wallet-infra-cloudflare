@@ -397,7 +397,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         if state.can_add() {
             if let Some(&off) = offsets.get(entity_names::PROVEN_TX) {
                 let v = self
-                    .fetch_proven_txs_for_sync(since, off, state.remaining_items())
+                    .fetch_proven_txs_for_sync(user_id, since, off, state.remaining_items())
                     .await?;
                 if !v.is_empty() {
                     state.add_items(v.len() as u32, estimate_size(&v));
@@ -408,7 +408,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         if state.can_add() {
             if let Some(&off) = offsets.get(entity_names::PROVEN_TX_REQ) {
                 let v = self
-                    .fetch_proven_tx_reqs_for_sync(since, off, state.remaining_items())
+                    .fetch_proven_tx_reqs_for_sync(user_id, since, off, state.remaining_items())
                     .await?;
                 if !v.is_empty() {
                     state.add_items(v.len() as u32, estimate_size(&v));
@@ -743,20 +743,25 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
 
     async fn fetch_proven_txs_for_sync(
         &self,
+        user_id: i64,
         since: Option<DateTime<Utc>>,
         offset: u32,
         limit: u32,
     ) -> Result<Vec<TableProvenTx>> {
+        // TENANT-SCOPED. `proven_txs` is a GLOBAL pool (no user_id column). A sync must return ONLY the
+        // proven_txs THIS user's transactions reference, never another tenant's proofs. The wallet needs
+        // exactly the proofs its own transactions link to (via transactions.proven_tx_id), so scope there.
         let mut sql = String::from(
             "SELECT proven_tx_id, txid, height, idx, block_hash, merkle_root, \
              hex(merkle_path) AS merkle_path_hex, hex(raw_tx) AS raw_tx_hex, created_at, updated_at \
-             FROM proven_txs WHERE 1=1",
+             FROM proven_txs WHERE proven_tx_id IN \
+             (SELECT proven_tx_id FROM transactions WHERE user_id = ? AND proven_tx_id IS NOT NULL)",
         );
         if since.is_some() {
             sql.push_str(" AND updated_at > ?");
         }
         sql.push_str(" ORDER BY updated_at ASC LIMIT ? OFFSET ?");
-        let mut q = Query::new(sql);
+        let mut q = Query::new(sql).bind(user_id);
         if let Some(s) = since {
             q = q.bind(s);
         }
@@ -788,20 +793,25 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
 
     async fn fetch_proven_tx_reqs_for_sync(
         &self,
+        user_id: i64,
         since: Option<DateTime<Utc>>,
         offset: u32,
         limit: u32,
     ) -> Result<Vec<TableProvenTxReq>> {
+        // TENANT-SCOPED, like proven_txs: `proven_tx_reqs` is a GLOBAL, txid-keyed broadcast pool
+        // (no user_id), carrying raw_tx + input_beef + history. Return only the reqs for THIS user's own
+        // transactions (matched by txid), never another tenant's broadcast requests.
         let mut sql = String::from(
             "SELECT proven_tx_req_id, proven_tx_id, txid, status, attempts, history, notified, notify, \
              hex(raw_tx) AS raw_tx_hex, hex(input_beef) AS input_beef_hex, batch, created_at, updated_at \
-             FROM proven_tx_reqs WHERE 1=1",
+             FROM proven_tx_reqs WHERE txid IN \
+             (SELECT txid FROM transactions WHERE user_id = ? AND txid IS NOT NULL)",
         );
         if since.is_some() {
             sql.push_str(" AND updated_at > ?");
         }
         sql.push_str(" ORDER BY updated_at ASC LIMIT ? OFFSET ?");
-        let mut q = Query::new(sql);
+        let mut q = Query::new(sql).bind(user_id);
         if let Some(s) = since {
             q = q.bind(s);
         }
