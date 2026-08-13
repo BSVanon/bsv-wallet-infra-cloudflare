@@ -115,6 +115,14 @@ pub async fn dispatch<B: crate::services::BroadcastService + crate::services::Pr
         // path is funds-restore and must not be touched for a UI feature.
         "statBackups" => handle_stat_backups(storage, params, id.clone(), auth).await,
 
+        // BRC-38 CHUNKED backup (413 launch fix): R2 native multipart upload for
+        // a backup blob that exceeds the request-body cap. Parts assemble into the
+        // SAME single object `putBackup` writes, so the read/restore path is
+        // byte-identical. `completeBackup` is the atomic commit.
+        "startBackup" => handle_start_backup(storage, params, id.clone(), auth).await,
+        "uploadBackupPart" => handle_upload_backup_part(storage, params, id.clone(), auth).await,
+        "completeBackup" => handle_complete_backup(storage, params, id.clone(), auth).await,
+
         // Phase 4: Monitor
         "reviewStatus" => handle_review_status(storage, id.clone(), auth).await,
 
@@ -639,13 +647,9 @@ async fn handle_put_backup<
         Value::Array(arr) => arr.get(1).and_then(|v| v.as_str()),
         _ => None,
     };
-    let key = match device_id {
-        Some(d) => {
-            validate_device_id(d)?;
-            backup_device_object_key(&auth.identity_key, d)
-        }
-        None => backup_object_key(&auth.identity_key),
-    };
+    // Single source of truth for the object key — MUST match the multipart
+    // `completeBackup` path so both land at the same object the restore reads.
+    let key = backup_write_key(&auth.identity_key, device_id)?;
     storage
         .blobs()
         .put(&key, bytes.clone())
@@ -897,6 +901,232 @@ async fn handle_stat_backups<
     Ok(serde_json::to_value(JsonRpcResponse::success(
         id,
         serde_json::json!({ "objects": objects }),
+    ))
+    .unwrap())
+}
+
+// =============================================================================
+// BRC-38 CHUNKED backup (413 launch fix): R2 native multipart upload.
+//
+// WHY: `putBackup` delivers the whole encrypted §6-closure blob in ONE request
+// body, but the Worker rejects any body over `MAX_REQUEST_BODY_BYTES` (8 MiB) to
+// avoid an OOM mid-parse. As a wallet's history grows, that single blob exceeds
+// the cap and every backup 413s forever — the funds-map can no longer be made
+// durable. Chunking the WRITE with R2 multipart removes the ceiling WITHOUT
+// touching the read/restore path: the parts assemble into the SAME single R2
+// object at the SAME key `putBackup` would have written, so `getBackup` /
+// `listBackups` are byte-identical and the BRC-2 AEAD tag still verifies the
+// whole blob on decrypt. `complete` is the atomic commit — a reader sees the
+// prior whole object until then, so an interrupted backup never strands funds.
+//
+// Worker invocations are STATELESS, so the multipart handle cannot be held
+// across the three calls: the client carries the `uploadId` (from startBackup)
+// and each part's `{partNumber, etag}` (from uploadBackupPart) and hands them
+// back to completeBackup, which reconstructs the parts and commits. The object
+// KEY is derived from the caller's identity + deviceId identically on all three
+// calls (see `backup_write_key`), so `resume_multipart_upload(key, uploadId)`
+// always targets the same object.
+// =============================================================================
+
+/// The R2 object key a backup WRITE targets. It MUST be identical across the
+/// single-shot `putBackup` and the multipart `startBackup`/`uploadBackupPart`/
+/// `completeBackup` path, or a multipart-completed object lands at a key the
+/// restore read never looks at (silent funds-map loss). A present `deviceId` is
+/// validated and selects the per-device object; absent = the legacy single
+/// object (back-compat). Single source of truth for all four handlers.
+fn backup_write_key(identity_key: &str, device_id: Option<&str>) -> Result<String, Error> {
+    match device_id {
+        Some(d) => {
+            validate_device_id(d)?;
+            Ok(backup_device_object_key(identity_key, d))
+        }
+        None => Ok(backup_object_key(identity_key)),
+    }
+}
+
+/// Pull an optional `deviceId` from either a positional array (at `array_index`)
+/// or a `{deviceId}` object — mirrors `handle_put_backup`'s dual-format accept.
+fn extract_device_id(params: &Value, array_index: usize) -> Option<&str> {
+    match params {
+        Value::Object(_) => params.get("deviceId").and_then(|v| v.as_str()),
+        Value::Array(arr) => arr.get(array_index).and_then(|v| v.as_str()),
+        _ => None,
+    }
+}
+
+/// R2/S3 multipart caps an object at 10 000 parts. With ≥5 MiB parts that is a
+/// 50 GiB backup ceiling — far above any real wallet — but bound it so a
+/// malformed client can't request an absurd part number.
+const MAX_BACKUP_PARTS: u64 = 10_000;
+
+/// `startBackup([deviceId?])` — open an R2 multipart upload for this identity's
+/// backup object and return its `uploadId`. Does NOT write any bytes; the prior
+/// whole object (if any) stays live and readable until `completeBackup`.
+async fn handle_start_backup<
+    B: crate::services::BroadcastService + crate::services::ProofService,
+>(
+    storage: &StorageD1<'_, B>,
+    params: Value,
+    id: Value,
+    auth: Option<&AuthId>,
+) -> Result<Value, Error> {
+    let auth = auth
+        .ok_or_else(|| Error::ValidationError("startBackup requires authentication".to_string()))?;
+    let (_user_id, auth) = storage.resolve_auth(auth).await?;
+
+    let device_id = extract_device_id(&params, 0);
+    let key = backup_write_key(&auth.identity_key, device_id)?;
+
+    let mpu = storage
+        .blobs()
+        .create_multipart_upload(&key)
+        .execute()
+        .await
+        .map_err(|e| Error::InternalError(format!("startBackup: create multipart failed: {}", e)))?;
+    let upload_id = mpu.upload_id().await;
+
+    Ok(serde_json::to_value(JsonRpcResponse::success(
+        id,
+        serde_json::json!({ "uploadId": upload_id }),
+    ))
+    .unwrap())
+}
+
+/// `uploadBackupPart([uploadId, partNumber, blob, deviceId?])` — upload one part
+/// (base64 ciphertext) of an in-flight multipart backup. Returns the
+/// `{partNumber, etag}` the client must hand back to `completeBackup`. Every part
+/// except the last must be the SAME size and ≥5 MiB (R2 rule) — the producing
+/// client enforces that; the server just stores what it's given.
+async fn handle_upload_backup_part<
+    B: crate::services::BroadcastService + crate::services::ProofService,
+>(
+    storage: &StorageD1<'_, B>,
+    params: Value,
+    id: Value,
+    auth: Option<&AuthId>,
+) -> Result<Value, Error> {
+    use base64::Engine as _;
+    let auth = auth.ok_or_else(|| {
+        Error::ValidationError("uploadBackupPart requires authentication".to_string())
+    })?;
+    let (_user_id, auth) = storage.resolve_auth(auth).await?;
+
+    let arr = params.as_array().ok_or_else(|| {
+        Error::ValidationError("uploadBackupPart: expected [uploadId, partNumber, blob, deviceId?]".to_string())
+    })?;
+    let upload_id = arr
+        .first()
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::ValidationError("uploadBackupPart: missing uploadId".to_string()))?;
+    let part_number_u64 = arr
+        .get(1)
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| Error::ValidationError("uploadBackupPart: missing partNumber".to_string()))?;
+    if part_number_u64 < 1 || part_number_u64 > MAX_BACKUP_PARTS {
+        return Err(Error::ValidationError(format!(
+            "uploadBackupPart: partNumber {} out of range 1..={}",
+            part_number_u64, MAX_BACKUP_PARTS
+        )));
+    }
+    let part_number = part_number_u64 as u16;
+    let blob_b64 = arr
+        .get(2)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::ValidationError("uploadBackupPart: missing blob".to_string()))?;
+    let device_id = arr.get(3).and_then(|v| v.as_str());
+
+    let key = backup_write_key(&auth.identity_key, device_id)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(blob_b64.as_bytes())
+        .map_err(|e| Error::ValidationError(format!("uploadBackupPart: bad base64 blob: {}", e)))?;
+
+    let mpu = storage
+        .blobs()
+        .resume_multipart_upload(&key, upload_id)
+        .map_err(|e| Error::InternalError(format!("uploadBackupPart: resume failed: {}", e)))?;
+    let uploaded = mpu
+        .upload_part(part_number, bytes)
+        .await
+        .map_err(|e| Error::InternalError(format!("uploadBackupPart: upload_part failed: {}", e)))?;
+
+    Ok(serde_json::to_value(JsonRpcResponse::success(
+        id,
+        serde_json::json!({ "partNumber": uploaded.part_number(), "etag": uploaded.etag() }),
+    ))
+    .unwrap())
+}
+
+/// `completeBackup([uploadId, [{partNumber, etag}...], deviceId?])` — atomically
+/// commit the multipart upload. Parts are reconstructed from the client-carried
+/// `{partNumber, etag}` list (stateless Worker) and sorted ascending (R2
+/// requires ascending part order). On success the object is immediately globally
+/// readable at its key — this is the ONLY point at which the new backup replaces
+/// the old one.
+async fn handle_complete_backup<
+    B: crate::services::BroadcastService + crate::services::ProofService,
+>(
+    storage: &StorageD1<'_, B>,
+    params: Value,
+    id: Value,
+    auth: Option<&AuthId>,
+) -> Result<Value, Error> {
+    use worker::UploadedPart;
+    let auth = auth.ok_or_else(|| {
+        Error::ValidationError("completeBackup requires authentication".to_string())
+    })?;
+    let (_user_id, auth) = storage.resolve_auth(auth).await?;
+
+    let arr = params.as_array().ok_or_else(|| {
+        Error::ValidationError("completeBackup: expected [uploadId, parts, deviceId?]".to_string())
+    })?;
+    let upload_id = arr
+        .first()
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::ValidationError("completeBackup: missing uploadId".to_string()))?;
+    let parts_val = arr
+        .get(1)
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| Error::ValidationError("completeBackup: missing parts array".to_string()))?;
+    let device_id = arr.get(2).and_then(|v| v.as_str());
+    let key = backup_write_key(&auth.identity_key, device_id)?;
+
+    // Reconstruct + sort ascending by partNumber (R2 requires ascending order).
+    let mut parts: Vec<(u16, String)> = Vec::with_capacity(parts_val.len());
+    for p in parts_val {
+        let pn = p
+            .get("partNumber")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| Error::ValidationError("completeBackup: part missing partNumber".to_string()))?;
+        let etag = p
+            .get("etag")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::ValidationError("completeBackup: part missing etag".to_string()))?;
+        parts.push((pn as u16, etag.to_string()));
+    }
+    if parts.is_empty() {
+        return Err(Error::ValidationError(
+            "completeBackup: no parts to complete".to_string(),
+        ));
+    }
+    parts.sort_by_key(|(pn, _)| *pn);
+    let uploaded_parts: Vec<UploadedPart> = parts
+        .into_iter()
+        .map(|(pn, etag)| UploadedPart::new(pn, etag))
+        .collect();
+    let n_parts = uploaded_parts.len();
+
+    let mpu = storage
+        .blobs()
+        .resume_multipart_upload(&key, upload_id)
+        .map_err(|e| Error::InternalError(format!("completeBackup: resume failed: {}", e)))?;
+    let obj = mpu
+        .complete(uploaded_parts)
+        .await
+        .map_err(|e| Error::InternalError(format!("completeBackup: complete failed: {}", e)))?;
+
+    Ok(serde_json::to_value(JsonRpcResponse::success(
+        id,
+        serde_json::json!({ "ok": true, "parts": n_parts, "bytes": obj.size() }),
     ))
     .unwrap())
 }
