@@ -102,8 +102,12 @@ fn is_double_spend_body(text: &str) -> bool {
     lower.contains("double spend")
         || lower.contains("double-spend")
         || lower.contains("txn-mempool-conflict")
-        || lower.contains("missing inputs")
         || lower.contains("already spent")
+}
+
+/// Check if the response body reports an orphan transaction whose parent is not known yet.
+fn is_missing_inputs_body(text: &str) -> bool {
+    text.to_lowercase().contains("missing inputs")
 }
 
 /// Check if the response body contains invalid-tx indicators.
@@ -217,6 +221,13 @@ fn process_broadcast_response(
     }
 
     if status == 466 {
+        if is_missing_inputs_body(text) {
+            return Err(BroadcastResponseError::TryNext(format!(
+                "ARC {} : {}",
+                status,
+                super::truncate_str(text, 200)
+            )));
+        }
         return Err(BroadcastResponseError::DoubleSpend(format!(
             "ARC {} : {}",
             status,
@@ -225,6 +236,13 @@ fn process_broadcast_response(
     }
 
     if matches!(status, 461..=463) {
+        if is_missing_inputs_body(text) {
+            return Err(BroadcastResponseError::TryNext(format!(
+                "ARC {} : {}",
+                status,
+                super::truncate_str(text, 200)
+            )));
+        }
         if is_double_spend_body(text) {
             return Err(BroadcastResponseError::DoubleSpend(format!(
                 "ARC {} : {}",
@@ -240,6 +258,13 @@ fn process_broadcast_response(
     }
 
     if (400..500).contains(&status) {
+        if is_missing_inputs_body(text) {
+            return Err(BroadcastResponseError::TryNext(format!(
+                "ARC {} : {}",
+                status,
+                super::truncate_str(text, 200)
+            )));
+        }
         if is_double_spend_body(text) {
             return Err(BroadcastResponseError::DoubleSpend(format!(
                 "ARC {} : {}",
@@ -552,8 +577,15 @@ mod tests {
     #[test]
     fn test_double_spend_body_patterns() {
         assert!(is_double_spend_body("double spend detected"));
+        assert!(is_double_spend_body("double-spend detected"));
         assert!(is_double_spend_body("txn-mempool-conflict"));
-        assert!(is_double_spend_body("missing inputs for tx"));
+        assert!(is_double_spend_body("input already spent"));
+        assert!(!is_double_spend_body("missing inputs for tx"));
+    }
+
+    #[test]
+    fn test_missing_inputs_body_pattern() {
+        assert!(is_missing_inputs_body("missing inputs for tx"));
     }
 
     #[test]
@@ -600,6 +632,32 @@ mod tests {
         assert!(matches!(
             process_broadcast_response(462, "script error"),
             Err(BroadcastResponseError::InvalidTx(_))
+        ));
+    }
+
+    #[test]
+    fn test_broadcast_missing_inputs_at_461_through_463_try_next() {
+        for status in 461..=463 {
+            assert!(matches!(
+                process_broadcast_response(status, "missing inputs for tx"),
+                Err(BroadcastResponseError::TryNext(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn test_broadcast_missing_inputs_at_generic_4xx_try_next() {
+        assert!(matches!(
+            process_broadcast_response(400, "missing inputs for tx"),
+            Err(BroadcastResponseError::TryNext(_))
+        ));
+    }
+
+    #[test]
+    fn test_broadcast_missing_inputs_at_466_try_next() {
+        assert!(matches!(
+            process_broadcast_response(466, "missing inputs for tx"),
+            Err(BroadcastResponseError::TryNext(_))
         ));
     }
 

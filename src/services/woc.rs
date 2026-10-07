@@ -178,9 +178,15 @@ impl BroadcastService for WocProvider {
             }
             // Classify by body content
             let lower = text.to_lowercase();
+            if lower.contains("missing inputs") {
+                return Err(BroadcastError::ServiceError(format!(
+                    "WoC {} : {}",
+                    status,
+                    super::truncate_str(&text, 200)
+                )));
+            }
             if lower.contains("double spend")
                 || lower.contains("txn-mempool-conflict")
-                || lower.contains("missing inputs")
                 || lower.contains("already spent")
             {
                 return Err(BroadcastError::DoubleSpend(format!(

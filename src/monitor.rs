@@ -23,19 +23,11 @@ use crate::d1::{QVal, Query};
 use crate::services::{BroadcastService, ProofService};
 
 /// Max attempts before marking a proven_tx_req as 'invalid'.
-/// At 5-min intervals, 12 attempts ≈ 60 minutes.
 ///
-/// Reference-aligned: the Go toolbox default is 10 attempts
-/// (`go-wallet-toolbox/pkg/defs/sync_tx_statuses.go`), the Rust toolbox uses
-/// 144 (`bsv-wallet-toolbox-rs/src/storage/sqlx/storage_sqlx.rs:2709`).
-/// We picked 12 (2 above Go) — conservative enough to not invalidate
-/// briefly-lagged TSC lookups, aggressive enough to purge true phantoms
-/// within an hour of broadcast. On the next monitor cycle, any req already
-/// past this threshold transitions unmined → invalid in a single UPDATE,
-/// matching reference semantics exactly (just the proven_tx_reqs status,
-/// no cascading transactions/outputs updates — the wallet layer handles
-/// UTXO release when needed).
-const MAX_PROOF_ATTEMPTS: i64 = 12;
+/// The canonical wallet-toolbox and wallet-infra mainnet
+/// `unprovenAttemptsLimitMain` value is 144. At this Worker's five-minute
+/// monitor cadence, 144 attempts are approximately 12 hours.
+const MAX_PROOF_ATTEMPTS: i64 = 144;
 
 // =============================================================================
 // Legacy WoC types — kept for parse_tsc_proof_response / tsc_proof_to_binary tests.
