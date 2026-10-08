@@ -451,12 +451,18 @@ async fn check_for_proofs<P: ProofService>(
     //
     // Status set matches Go toolbox's `statusesReadyToSync` in
     // `pkg/storage/internal/actions/synchronize_tx_statuses.go:31`:
-    // callback, unmined, sending, unknown, unconfirmed, reorg. Excludes
-    // `unprocessed` deliberately — that's a pre-broadcast state, handled
-    // by SendWaitingTransactions, not by the proof-fetch path.
+    // callback, unmined, sending, unknown, unconfirmed, reorg — plus
+    // `unsent`. send_waiting keeps a failed broadcast's status unchanged, so
+    // an `unsent` req it has already tried is the reference's `sending`
+    // (TaskSendWaiting moves unsent → sending on pickup); without it here, a
+    // req whose broadcast never succeeds is retried forever with its inputs
+    // locked. The proof-fetch loop below checks `unsent` too, so a tx that
+    // reached the chain some other way completes instead of being swept.
+    // Excludes `unprocessed` deliberately — that's a pre-broadcast state,
+    // handled by SendWaitingTransactions, not by the proof-fetch path.
     let swept = Query::new(
         "UPDATE proven_tx_reqs SET status = 'invalid', updated_at = ? \
-         WHERE status IN ('unmined', 'unknown', 'unconfirmed', 'callback', 'sending', 'reorg') \
+         WHERE status IN ('unmined', 'unknown', 'unconfirmed', 'callback', 'sending', 'unsent', 'reorg') \
            AND attempts >= ?",
     )
     .bind(Utc::now().to_rfc3339().as_str())
@@ -484,7 +490,7 @@ async fn check_for_proofs<P: ProofService>(
         // runs before every proof-fetch cycle.
         "SELECT proven_tx_req_id, txid, status, attempts, hex(raw_tx) as raw_tx \
          FROM proven_tx_reqs \
-         WHERE status IN ('unmined', 'unknown', 'unconfirmed', 'callback', 'sending', 'reorg') \
+         WHERE status IN ('unmined', 'unknown', 'unconfirmed', 'callback', 'sending', 'unsent', 'reorg') \
          ORDER BY attempts ASC, created_at DESC \
          LIMIT 50",
     )
